@@ -1,4 +1,4 @@
-Xの投稿内容をBlueskyにクロスポストするUserScript
+Xの投稿内容をBlueskyにクロスポストするUserScript、
 素人がチャットAIで作ったのでまともに動かないと思います
 一応、注意事項は以下
 
