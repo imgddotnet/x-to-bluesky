@@ -5,7 +5,7 @@ X（旧 Twitter ）の投稿内容を Bluesky へクロスポストする UserSc
 - 動作は無保証、使う場合は自己責任でお願いします
 - Mac/iPad/iPhone の Safari と Tampermonkey機能拡張でテストしましたが、Tampermonkey の @connect 処理判定を緩めたりしないと動かないような気がします（互換機能拡張の Stay なら動くかも）
 - 元ネタの https://github.com/59de44955ebd/twitter-to-bsky と比べると、Mastodon 処理がオミットされ、投稿内容のハッシュタグと URL がハイパーリンク化されます。リンクカードは生成できなんだ
-- 画像を添付すると、　X にはポストされますが Bluesky にはポストされません。UserScriptの限界かも
+- 画像を添付すると X にはポストされますが Bluesky にはポストされません。UserScript の限界かも
 - 動画の添付はテストしてません
 - GitHub の作法を知らないので、要望やリクエストをもらっても反映方法や修正の仕方すら分かりません
 
