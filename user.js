@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         x-to-bluesky
-// @version      1.0b
+// @version      1.0a
 // @description  Crosspost from X (formerly Twitter) to Bluesky with enhancements, and an option for Buffer popups.
 // @author       imgddotnet (Modified by Gemini)
 // @license      MIT
@@ -24,7 +24,7 @@
 (function() {
     'use strict';
 
-    // --- セレクタの統合 (短縮: S) ---
+    // --- セレクタの統合 ---
     const S = {
         NAV_BAR: 'header nav[role="navigation"]',
         BSKY_NAV: 'header nav[role="navigation"]:not(.bsky-navbar)',
@@ -37,14 +37,14 @@
         COMPOSE_AREA: 'div[data-testid="tweetEditor"]',
     };
 
-    // --- 定数 (短縮) ---
+    // --- 定数 ---
     const BUF_URL = 'https://publish.buffer.com/compose?';
     const P_W = 600; // POPUP_WIDTH
     const P_H = 800; // POPUP_HEIGHT
     const VER = 'v1.0r'; // SCRIPT_VERSION
     const B_ICO = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzEwNTRGRiIgZD0iTTEyIDEuNjkybC01LjY5MiA5LjY5Mmw1LjY5MiA5LjY5Mmw1LjY5Mi05LjY5MnoiLz48L3N2Zz4='; // BSKY_ICON_DATA_URI
 
-    // --- グローバル変数 (短縮) ---
+    // --- グローバル変数 ---
     let pds = GM_getValue('bsky_pds_url', 'https://bsky.social'); // bsky_pds_url
     let hndl = GM_getValue('bsky_handle', ''); // bsky_handle
     let pwd = GM_getValue('bsky_app_password', ''); // bsky_app_password
@@ -55,7 +55,7 @@
     let sDiv = null; // settings_div
     let isPst = false; // isPosting
 
-    // --- テキスト/バイト計算ユーティリティ (短縮: TU) ---
+    // --- テキスト/バイト計算ユーティリティ ---
     const TU = {
         encoder: new TextEncoder(),
 
