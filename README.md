@@ -1,6 +1,6 @@
 X（旧 Twitter ）の投稿内容を Bluesky へクロスポストする UserScript です。
 素人がチャットAI（主にGemini）の力を借りて作ったのでまともに動かないと思います。
-一応、注意事項は以下：
+一応、注意事項は以下。いろいろすみません：
 
 - 動作は無保証、使う場合は自己責任でお願いします
 - Mac/iPad/iPhone の Safari と Tampermonkey機能拡張でテストしましたが、Tampermonkey の @connect 処理判定を緩めたりしないと動かないような気がします（互換機能拡張の Stay なら動くかも）
