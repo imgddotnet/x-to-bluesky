@@ -436,7 +436,7 @@
         .bsky-crosspost-checkbox input { margin-right: 4px; cursor: pointer; }
         .bsky-crosspost-checkbox span { font: 14px system-ui; cursor: pointer; }
         .bsky-crosspost-checkbox input:disabled + span { color: #888; cursor: default; }
-        .bsky-post-status-text { font: 12px system-ui; display: block; line-height: 38px; text-align: center; }
+        .bsky-post-status-text { font: 12px system-ui; display: block; line-height: 38px; text-align: center; color: #fff !important; }
         .bsky-notification { position: fixed; top: 12px; right: 50%; transform: translateX(50%); display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: rgb(29, 155, 240); color: white; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); font-family: system-ui; max-width: 320px; width: 90%; z-index: 99999; transition: opacity 0.5s, transform 0.5s; }
         .bsky-notification.error { background: rgb(244, 33, 46); }
         .bsky-notification.fade-out { opacity: 0; transform: translateX(50%) translateY(-100%); }
