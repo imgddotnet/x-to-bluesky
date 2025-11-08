@@ -39,7 +39,7 @@
     const BUFFER_UNIVERSAL_LINK = 'https://buffer.com/app/compose';
     const POPUP_WIDTH = 600;
     const POPUP_HEIGHT = 800;
-    const VERSION = 'v1.0a5'; // バージョンを更新
+    const VERSION = 'v1.0b'; // バージョンを更新
     const ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzU3OUZENiIgZD0iTTEyIDEuNjkybC01LjY5MiA5LjY5Mmw1LjY5MiA5LjY5Mmw1LjY5Mi05LjY5MnoiLz48L3N2Zz4=';
     const MAX_IMAGE_DIMENSION = 1024; // 添付画像の最大ピクセル寸法
     const IMAGE_COMPRESSION_QUALITY = 0.8; // 添付画像のJPEG圧縮品質
@@ -383,7 +383,7 @@
             </fieldset>
             <div class="checkbox-group">
                 <input type="checkbox" id="buffer-toggle" ${settings.bufferEnabled ? 'checked' : ''}>
-                <label for="buffer-toggle">Open Buffer post window (SideNav only)</label>
+                <label for="buffer-toggle">Open Buffer post window</label>
             </div>
             <div class="settings-actions">
                 <div class="version">${VERSION}</div>
