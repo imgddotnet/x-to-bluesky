@@ -89,75 +89,91 @@
 
     const isDesktop = () => document.querySelector(SELECTORS.NAV_BAR) !== null;
 
-    // 画像リサイズとJPEG変換を行う汎用関数
+    // 画像リサイズとJPEG変換を行う汎用関数（アスペクト比情報を返す）
     const resizeImageBlob = (blob, maxDimension, quality) => {
-        return new Promise(resolve => {
+        return new Promise((resolve, reject) => {
             const canvas = document.createElement('canvas');
             const ctx = canvas.getContext('2d');
             const image = new Image();
 
             image.onload = () => {
-                let width = image.width;
-                let height = image.height;
+                URL.revokeObjectURL(url);
+                
+                let width = image.naturalWidth;
+                let height = image.naturalHeight;
 
-                // アスペクト比を維持してリサイズ (最大寸法を超えないように)
-                if (width > maxDimension || height > maxDimension) {
+                // 元の画像サイズが小さい場合は拡大しない
+                const needsResize = width > maxDimension || height > maxDimension;
+
+                if (needsResize) {
+                    // アスペクト比を維持してリサイズ
                     if (width > height) {
-                        height *= maxDimension / width;
+                        height = Math.round((height * maxDimension) / width);
                         width = maxDimension;
                     } else {
-                        width *= maxDimension / height;
+                        width = Math.round((width * maxDimension) / height);
                         height = maxDimension;
                     }
                 }
 
                 canvas.width = width;
                 canvas.height = height;
+
+                // 高品質な描画設定
+                ctx.imageSmoothingEnabled = true;
+                ctx.imageSmoothingQuality = 'high';
+
                 // 背景を白で塗りつぶす（透過PNG対策）
                 ctx.fillStyle = '#FFFFFF';
                 ctx.fillRect(0, 0, width, height);
                 ctx.drawImage(image, 0, 0, width, height);
 
                 // toBlobでJPEGに変換し、品質を調整 (ファイルサイズを削減)
-                canvas.toBlob(resolve, 'image/jpeg', quality);
+                canvas.toBlob(
+                    (resultBlob) => {
+                        if (resultBlob) {
+                            console.log(`[X-to-Bluesky] Image resized: ${image.naturalWidth}x${image.naturalHeight} -> ${width}x${height}, size: ${Math.round(resultBlob.size / 1024)}KB`);
+                            // アスペクト比情報も一緒に返す
+                            resolve({
+                                blob: resultBlob,
+                                aspectRatio: {
+                                    width: width,
+                                    height: height
+                                }
+                            });
+                        } else {
+                            console.warn('[X-to-Bluesky] Failed to create blob, using original');
+                            resolve({
+                                blob: blob,
+                                aspectRatio: {
+                                    width: image.naturalWidth,
+                                    height: image.naturalHeight
+                                }
+                            });
+                        }
+                    },
+                    'image/jpeg',
+                    quality
+                );
             };
-            image.onerror = () => {
-                console.warn('[X-to-Bluesky] Failed to load image for resizing. Using original blob.');
-                resolve(blob);
+
+            image.onerror = (error) => {
+                console.warn('[X-to-Bluesky] Failed to load image for resizing:', error);
+                // エラー時は元のblobとデフォルトのアスペクト比を返す
+                resolve({
+                    blob: blob,
+                    aspectRatio: { width: 1, height: 1 }
+                });
             };
 
             // Blob URLを作成して画像ソースに設定し、ロード後に解放
             const url = URL.createObjectURL(blob);
             image.src = url;
-
-            // ロード後にBlob URLを解放
-            image.onload = () => {
-                URL.revokeObjectURL(url);
-
-                let width = image.width;
-                let height = image.height;
-
-                if (width > maxDimension || height > maxDimension) {
-                    if (width > height) {
-                        height *= maxDimension / width;
-                        width = maxDimension;
-                    } else {
-                        width *= maxDimension / height;
-                        height = maxDimension;
-                    }
-                }
-                canvas.width = width;
-                canvas.height = height;
-                ctx.fillStyle = '#FFFFFF';
-                ctx.fillRect(0, 0, width, height);
-                ctx.drawImage(image, 0, 0, width, height);
-                canvas.toBlob(resolve, 'image/jpeg', quality);
-            };
         });
     };
 
 
-    // URLからリンクカード情報を取得（GM_xmlhttpRequestでCORS回避）
+    // URLからリンクカード情報を取得(GM_xmlhttpRequestでCORS回避)
     const fetchLinkCard = async (url) => {
         console.log('[X-to-Bluesky] Fetching link card for URL:', url);
 
@@ -187,7 +203,7 @@
                             return '';
                         };
 
-                        // タイトルの取得（優先順位: og:title > twitter:title > title タグ > ドメイン名）
+                        // タイトルの取得(優先順位: og:title > twitter:title > title タグ > ドメイン名)
                         let title = getMetaContent(['og:title', 'twitter:title']);
                         if (!title) {
                             const titleTag = doc.querySelector('title');
@@ -207,10 +223,10 @@
                             }
                         }
 
-                        // 説明文の取得（優先順位: og:description > twitter:description > description）
+                        // 説明文の取得(優先順位: og:description > twitter:description > description)
                         let description = getMetaContent(['og:description', 'twitter:description', 'description']);
 
-                        // 画像URLの取得（優先順位: og:image > twitter:image > twitter:image:src > og:image:secure_url）
+                        // 画像URLの取得(優先順位: og:image > twitter:image > twitter:image:src > og:image:secure_url)
                         let imageUrl = getMetaContent(['og:image', 'twitter:image', 'twitter:image:src', 'og:image:secure_url']);
 
                         // 相対URLを絶対URLに変換
@@ -553,10 +569,14 @@
 
                         // ★★★ 画像リサイズ処理を適用 (ファイルサイズ超過対策) ★★★
                         console.log('[X-to-Bluesky] Resizing image for upload limit...');
-                        const resizedBlob = await resizeImageBlob(blob, MAX_IMAGE_DIMENSION, IMAGE_COMPRESSION_QUALITY);
+                        const resizedResult = await resizeImageBlob(blob, MAX_IMAGE_DIMENSION, IMAGE_COMPRESSION_QUALITY);
 
-                        const uploaded = await bskyAPI.uploadBlob(resizedBlob);
-                        images.push({ alt: img.alt || '', image: uploaded });
+                        const uploaded = await bskyAPI.uploadBlob(resizedResult.blob);
+                        images.push({ 
+                            alt: img.alt || '', 
+                            image: uploaded,
+                            aspectRatio: resizedResult.aspectRatio 
+                        });
                         console.log('[X-to-Bluesky] Image uploaded successfully after resize.');
                     } catch (err) {
                         console.error('Failed to upload image (even after resize):', err);
@@ -614,7 +634,7 @@
                                 description: cardData.description.substring(0, 1000)
                             };
 
-                            // サムネイル画像のアップロード（あれば）
+                            // サムネイル画像のアップロード(あれば)
                             if (cardData.imageUrl) {
                                 try {
                                     console.log('[X-to-Bluesky] Uploading thumbnail:', cardData.imageUrl);
@@ -624,10 +644,10 @@
 
                                         // ★★★ サムネイル画像リサイズ処理を適用 ★★★
                                         console.log('[X-to-Bluesky] Resizing thumbnail image...');
-                                        // サムネイルは小さめ（例: 600px）で圧縮率を少し高めに
-                                        const resizedThumbBlob = await resizeImageBlob(imgBlob, 600, 0.7);
+                                        // サムネイルは小さめ(例: 600px)で圧縮率を少し高めに
+                                        const resizedThumbResult = await resizeImageBlob(imgBlob, 600, 0.7);
 
-                                        const thumbBlob = await bskyAPI.uploadBlob(resizedThumbBlob);
+                                        const thumbBlob = await bskyAPI.uploadBlob(resizedThumbResult.blob);
                                         external.thumb = thumbBlob;
                                         console.log('[X-to-Bluesky] Thumbnail uploaded successfully after resize');
                                     } else {
