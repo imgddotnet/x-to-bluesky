@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         x-to-bluesky
-// @version      1.0a2
-// @description  Crosspost from X (formerly Twitter) to Bluesky with enhancements, and an option for Buffer popups.
-// @author       imgddotnet (Modified by Gemini)
+// @version      1.0a3
+// @description  Crosspost from X (formerly Twitter) to Bluesky with link cards, images, and videos
+// @author       imgddotnet (Modified by Gemini & Claude)
 // @license      MIT
 // @namespace    imgddotnet
 // @match        htt*://*x.com/*
@@ -27,18 +27,17 @@
         BSKY_NAV: 'header nav[role="navigation"]:not(.bsky-navbar)',
         POST_TOOLBAR: 'div[data-testid="toolBar"]:not(.bsky-toolbar)',
         POST_BUTTON: '[data-testid="tweetButton"], [data-testid="tweetButtonInline"]',
-        // モバイル版の右下丸ボタンを含む複数のセレクタ（より広範囲にマッチ）
         SIDE_NAV_POST_BUTTON: '[data-testid="SideNav_NewTweet_Button"], a[href="/compose/post"], a[href="/compose/tweet"], a[aria-label*="Post"]',
-        // モバイル版の右下丸ボタンを直接指定
         MOBILE_FAB_BUTTON: 'a[href="/compose/post"], a[href="/compose/tweet"]',
         TEXT_AREA: '[data-testid="tweetTextarea_0"]',
         ATTACHMENTS: 'div[data-testid="attachments"] img',
+        VIDEO_ATTACHMENTS: 'div[data-testid="attachments"] video',
         QUOTE_LINK: '[data-testid="tweetEditor"] [data-testid^="card.layout"] a[href*="/status/"]'
     };
 
     const BUFFER_URL = 'https://publish.buffer.com/compose?';
-    const BUFFER_UNIVERSAL_LINK = 'https://buffer.com/app/compose'; // ユニバーサルリンク
-    const BUFFER_APP_SCHEME = 'bufferapp://compose'; // フォールバック用
+    const BUFFER_UNIVERSAL_LINK = 'https://buffer.com/app/compose';
+    const BUFFER_APP_SCHEME = 'bufferapp://compose';
     const POPUP_WIDTH = 600;
     const POPUP_HEIGHT = 800;
     const VERSION = 'v1.0a3';
@@ -84,11 +83,113 @@
 
     const isIPhone = () => {
         const ua = navigator.userAgent;
-        // iPhoneまたはiPod（iPadを除外）
         return (/iPhone/i.test(ua) || /iPod/i.test(ua)) && !/iPad/i.test(ua);
     };
-    
+
     const isDesktop = () => document.querySelector(SELECTORS.NAV_BAR) !== null;
+
+    // URLからリンクカード情報を取得（GM_xmlhttpRequestでCORS回避）
+    const fetchLinkCard = async (url) => {
+        console.log('[X-to-Bluesky] Fetching link card for URL:', url);
+        
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                onload: (response) => {
+                    console.log('[X-to-Bluesky] Response status:', response.status);
+                    try {
+                        const html = response.responseText;
+                        const parser = new DOMParser();
+                        const doc = parser.parseFromString(html, 'text/html');
+
+                        // OGPメタデータ取得のヘルパー関数
+                        const getMetaContent = (properties) => {
+                            for (const prop of properties) {
+                                const meta = doc.querySelector(`meta[property="${prop}"], meta[name="${prop}"]`);
+                                const content = meta?.getAttribute('content');
+                                if (content && content.trim()) {
+                                    console.log(`[X-to-Bluesky] Found ${prop}:`, content.trim());
+                                    return content.trim();
+                                }
+                            }
+                            return '';
+                        };
+
+                        // タイトルの取得（優先順位: og:title > twitter:title > title タグ > ドメイン名）
+                        let title = getMetaContent(['og:title', 'twitter:title']);
+                        if (!title) {
+                            const titleTag = doc.querySelector('title');
+                            title = titleTag?.textContent?.trim() || '';
+                            console.log('[X-to-Bluesky] Title tag:', title);
+                        }
+                        
+                        // 最終フォールバック: ドメイン名を使用
+                        if (!title) {
+                            try {
+                                const urlObj = new URL(url);
+                                title = urlObj.hostname;
+                                console.log('[X-to-Bluesky] Using hostname as title:', title);
+                            } catch (e) {
+                                title = 'Link';
+                                console.log('[X-to-Bluesky] Using fallback title: Link');
+                            }
+                        }
+
+                        // 説明文の取得（優先順位: og:description > twitter:description > description）
+                        let description = getMetaContent(['og:description', 'twitter:description', 'description']);
+
+                        // 画像URLの取得（優先順位: og:image > twitter:image > twitter:image:src）
+                        let imageUrl = getMetaContent(['og:image', 'twitter:image', 'twitter:image:src']);
+                        
+                        // 相対URLを絶対URLに変換
+                        if (imageUrl && !imageUrl.startsWith('http')) {
+                            try {
+                                const baseUrl = new URL(url);
+                                imageUrl = new URL(imageUrl, baseUrl.origin).href;
+                                console.log('[X-to-Bluesky] Resolved image URL:', imageUrl);
+                            } catch (e) {
+                                console.warn('[X-to-Bluesky] Failed to resolve relative image URL:', e);
+                                imageUrl = '';
+                            }
+                        }
+
+                        console.log('[X-to-Bluesky] Final link card data:', { title, description, imageUrl });
+                        resolve({ title, description, imageUrl });
+                    } catch (error) {
+                        console.error('[X-to-Bluesky] Failed to parse link card data:', error);
+                        // パース失敗時は最低限の情報を返す
+                        try {
+                            const urlObj = new URL(url);
+                            resolve({ title: urlObj.hostname, description: '', imageUrl: '' });
+                        } catch (e) {
+                            resolve({ title: 'Link', description: '', imageUrl: '' });
+                        }
+                    }
+                },
+                onerror: (error) => {
+                    console.error('[X-to-Bluesky] Failed to fetch link card:', error);
+                    // エラー時も最低限の情報を返す
+                    try {
+                        const urlObj = new URL(url);
+                        resolve({ title: urlObj.hostname, description: '', imageUrl: '' });
+                    } catch (e) {
+                        resolve({ title: 'Link', description: '', imageUrl: '' });
+                    }
+                },
+                ontimeout: () => {
+                    console.warn('[X-to-Bluesky] Link card fetch timeout');
+                    try {
+                        const urlObj = new URL(url);
+                        resolve({ title: urlObj.hostname, description: '', imageUrl: '' });
+                    } catch (e) {
+                        resolve({ title: 'Link', description: '', imageUrl: '' });
+                    }
+                },
+                timeout: 15000 // 15秒でタイムアウト（少し長めに設定）
+            });
+        });
+    };
 
     // Bluesky API
     const bskyAPI = {
@@ -131,7 +232,7 @@
             }
         },
 
-        async uploadImage(blob) {
+        async uploadBlob(blob) {
             const res = await this.request('POST', 'com.atproto.repo.uploadBlob', blob);
             return res.blob;
         },
@@ -242,7 +343,7 @@
         const checkbox = document.createElement('label');
         checkbox.className = 'bsky-crosspost-checkbox';
         checkbox.innerHTML = `
-            <input type="checkbox" ${settings.crosspostChecked ? 'checked' : ''} 
+            <input type="checkbox" ${settings.crosspostChecked ? 'checked' : ''}
                    ${!(settings.handle && settings.password) ? 'disabled' : ''}>
             <span>Bluesky</span>
         `;
@@ -254,7 +355,7 @@
 
         const controls = document.createElement('div');
         controls.className = 'bsky-controls-container';
-        
+
         if (!desktop) {
             const icon = document.createElement('div');
             icon.className = 'bsky-settings-icon-wrapper';
@@ -265,7 +366,7 @@
             };
             controls.appendChild(icon);
         }
-        
+
         controls.appendChild(checkbox);
 
         if (postBtn) {
@@ -282,12 +383,9 @@
         const desktop = isDesktop();
 
         if (isiPhone || !desktop) {
-            // iPhone/モバイル：ユニバーサルリンクを使用
-            // アプリがあれば自動的にアプリが開き、なければSafariでWebページが開く
             console.log('[X-to-Bluesky] Opening Buffer via Universal Link');
             window.location.href = BUFFER_UNIVERSAL_LINK;
         } else {
-            // デスクトップ：ポップアップウィンドウで開く
             console.log('[X-to-Bluesky] Opening Buffer popup for desktop');
             const w = window.innerWidth, h = window.innerHeight;
             const x = (window.screenX || window.screenLeft) + (w - POPUP_WIDTH) / 2;
@@ -308,7 +406,7 @@
         console.log('[X-to-Bluesky] isIPhone:', isiPhone);
         console.log('[X-to-Bluesky] isDesktop:', desktop);
 
-        // Buffer機能（左メニュー/右下の投稿ボタン）
+        // Buffer機能(左メニュー/右下の投稿ボタン)
         if (isSideNav && settings.bufferEnabled) {
             console.log('[X-to-Bluesky] Opening Buffer...');
             e.stopPropagation();
@@ -319,13 +417,13 @@
             return;
         }
 
-        // Buffer機能が無効な場合、左メニュー/右下ボタンは標準動作（投稿モーダルを開く）
+        // Buffer機能が無効な場合、左メニュー/右下ボタンは標準動作(投稿モーダルを開く)
         if (isSideNav) {
             console.log('[X-to-Bluesky] SideNav button - standard behavior');
             return;
         }
 
-        // Blueskyクロスポスト（投稿モーダル内の投稿ボタンのみ）
+        // Blueskyクロスポスト(投稿モーダル内の投稿ボタンのみ)
         console.log('[X-to-Bluesky] Checking for Bluesky crosspost...');
         if (!settings.crosspostChecked || !settings.handle || !settings.password || isPosting) return;
 
@@ -346,7 +444,6 @@
             const textarea = document.querySelector(SELECTORS.TEXT_AREA);
             const quoteLink = document.querySelector(SELECTORS.QUOTE_LINK);
             let text = textarea?.innerText || '';
-            if (quoteLink?.href) text += `\n${quoteLink.href}`;
 
             const record = {
                 $type: 'app.bsky.feed.post',
@@ -355,30 +452,115 @@
                 facets: parseFacets(text)
             };
 
+            // 画像添付の処理
             const attachments = document.querySelectorAll(SELECTORS.ATTACHMENTS);
+            const videos = document.querySelectorAll(SELECTORS.VIDEO_ATTACHMENTS);
+
             if (attachments.length > 0) {
                 const images = [];
                 for (const img of attachments) {
-                    const response = await fetch(img.src);
-                    const blob = await response.blob();
-                    
-                    const pngBlob = await new Promise(resolve => {
-                        const canvas = document.createElement('canvas');
-                        const ctx = canvas.getContext('2d');
-                        const image = new Image();
-                        image.onload = () => {
-                            canvas.width = image.width;
-                            canvas.height = image.height;
-                            ctx.drawImage(image, 0, 0);
-                            canvas.toBlob(resolve, 'image/png');
-                        };
-                        image.src = URL.createObjectURL(blob);
-                    });
+                    try {
+                        const response = await fetch(img.src);
+                        const blob = await response.blob();
 
-                    const uploaded = await bskyAPI.uploadImage(pngBlob);
-                    images.push({ alt: img.alt || '', image: uploaded });
+                        const pngBlob = await new Promise(resolve => {
+                            const canvas = document.createElement('canvas');
+                            const ctx = canvas.getContext('2d');
+                            const image = new Image();
+                            image.onload = () => {
+                                canvas.width = image.width;
+                                canvas.height = image.height;
+                                ctx.drawImage(image, 0, 0);
+                                canvas.toBlob(resolve, 'image/png');
+                            };
+                            image.src = URL.createObjectURL(blob);
+                        });
+
+                        const uploaded = await bskyAPI.uploadBlob(pngBlob);
+                        images.push({ alt: img.alt || '', image: uploaded });
+                    } catch (err) {
+                        console.warn('Failed to upload image:', err);
+                    }
                 }
-                record.embed = { $type: 'app.bsky.embed.images', images };
+                if (images.length > 0) {
+                    record.embed = { $type: 'app.bsky.embed.images', images };
+                }
+            } else if (videos.length > 0) {
+                // 動画添付の処理(努力目標 - 最初の動画のみ)
+                try {
+                    const video = videos[0];
+                    const response = await fetch(video.src);
+                    const blob = await response.blob();
+                    const uploaded = await bskyAPI.uploadBlob(blob);
+                    
+                    record.embed = {
+                        $type: 'app.bsky.embed.video',
+                        video: uploaded
+                    };
+                } catch (err) {
+                    console.warn('Failed to upload video:', err);
+                }
+            } else {
+                // リンクカードの処理(画像・動画がない場合、テキスト内のURLを検出)
+                const urlRegex = /(https?:\/\/[^\s]+)/g;
+                const urls = text.match(urlRegex);
+                
+                if (urls && urls.length > 0) {
+                    // 最初のURLに対してリンクカードを生成
+                    const url = urls[0];
+                    console.log('[X-to-Bluesky] Found URL in text:', url);
+                    
+                    try {
+                        const cardData = await fetchLinkCard(url);
+                        console.log('[X-to-Bluesky] Card data received:', cardData);
+                        
+                        // タイトルが存在すれば（必ず存在するはず）リンクカードを作成
+                        if (cardData && cardData.title) {
+                            const external = {
+                                uri: url,
+                                title: cardData.title.substring(0, 300),
+                                description: cardData.description.substring(0, 1000)
+                            };
+                            
+                            // サムネイル画像のアップロード（あれば）
+                            if (cardData.imageUrl) {
+                                try {
+                                    console.log('[X-to-Bluesky] Uploading thumbnail:', cardData.imageUrl);
+                                    const imgResponse = await fetch(cardData.imageUrl);
+                                    if (imgResponse.ok) {
+                                        const imgBlob = await imgResponse.blob();
+                                        const thumbBlob = await bskyAPI.uploadBlob(imgBlob);
+                                        external.thumb = thumbBlob;
+                                        console.log('[X-to-Bluesky] Thumbnail uploaded successfully');
+                                    } else {
+                                        console.warn('[X-to-Bluesky] Failed to fetch thumbnail, status:', imgResponse.status);
+                                    }
+                                } catch (err) {
+                                    console.warn('[X-to-Bluesky] Failed to upload thumbnail:', err);
+                                    // サムネイルなしでも続行
+                                }
+                            }
+
+                            record.embed = {
+                                $type: 'app.bsky.embed.external',
+                                external
+                            };
+                            console.log('[X-to-Bluesky] Link card embed created successfully:', record.embed);
+                        } else {
+                            console.warn('[X-to-Bluesky] No title found, skipping link card');
+                        }
+                    } catch (err) {
+                        console.error('[X-to-Bluesky] Failed to create link card:', err);
+                        // リンクカード作成失敗でも投稿は続行
+                    }
+                }
+            }
+
+            // 引用投稿の処理
+            if (quoteLink?.href) {
+                text += `\n${quoteLink.href}`;
+                record.text = text;
+                record.facets = parseFacets(text);
             }
 
             await bskyAPI.createPost(record);
@@ -403,7 +585,6 @@
             if (!toolbar.querySelector('.bsky-crosspost-checkbox')) addCrosspostControls(toolbar);
         });
 
-        // 通常の投稿ボタン
         document.querySelectorAll(SELECTORS.POST_BUTTON).forEach(btn => {
             if (!btn.hasAttribute('data-bsky-listener')) {
                 btn.addEventListener('click', handlePost, true);
@@ -411,7 +592,6 @@
             }
         });
 
-        // サイドナビ/モバイルFABボタン（より高優先度で設定）
         document.querySelectorAll(SELECTORS.SIDE_NAV_POST_BUTTON).forEach(btn => {
             if (!btn.hasAttribute('data-bsky-listener')) {
                 btn.addEventListener('click', handlePost, true);
