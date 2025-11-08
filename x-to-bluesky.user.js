@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         x-to-bluesky
-// @version      1.0b // バージョンを更新
+// @version      1.0b
 // @description  Crosspost from X (formerly Twitter) to Bluesky with link cards, images, and videos (Enhanced: Image Resize & Content-Type Fix)
 // @author       imgddotnet (Modified by Gemini & Claude)
 // @license      MIT
@@ -21,7 +21,7 @@
 (function() {
     'use strict';
 
-    // 定数
+    // セレクタ定義
     const SELECTORS = {
         NAV_BAR: 'header nav[role="navigation"]',
         BSKY_NAV: 'header nav[role="navigation"]:not(.bsky-navbar)',
@@ -39,12 +39,12 @@
     const BUFFER_UNIVERSAL_LINK = 'https://buffer.com/app/compose';
     const POPUP_WIDTH = 600;
     const POPUP_HEIGHT = 800;
-    const VERSION = 'v1.0b'; // バージョンを更新
+    const VERSION = 'v1.0b';
     const ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzU3OUZENiIgZD0iTTEyIDEuNjkybC01LjY5MiA5LjY5Mmw1LjY5MiA5LjY5Mmw1LjY5Mi05LjY5MnoiLz48L3N2Zz4=';
-    const MAX_IMAGE_DIMENSION = 1024; // 添付画像の最大ピクセル寸法
-    const IMAGE_COMPRESSION_QUALITY = 0.8; // 添付画像のJPEG圧縮品質
+    const MAX_IMAGE_DIMENSION = 1024;
+    const IMAGE_COMPRESSION_QUALITY = 0.8;
 
-    // グローバル変数
+    // 設定管理
     let settings = {
         pdsUrl: GM_getValue('bsky_pds_url', 'https://bsky.social'),
         handle: GM_getValue('bsky_handle', ''),
@@ -66,7 +66,6 @@
             { regex: /(#[\p{L}\p{N}_]+)/gu, type: 'app.bsky.richtext.facet#tag', extract: (m) => m.substring(1) },
             { regex: /(https?:\/\/[^\s]+)/g, type: 'app.bsky.richtext.facet#link', extract: (m) => m }
         ];
-
         patterns.forEach(({ regex, type, extract }) => {
             let match;
             while ((match = regex.exec(text)) !== null) {
@@ -78,7 +77,6 @@
                 });
             }
         });
-
         return facets;
     };
 
@@ -89,24 +87,29 @@
 
     const isDesktop = () => document.querySelector(SELECTORS.NAV_BAR) !== null;
 
-    // 画像リサイズとJPEG変換を行う汎用関数（アスペクト比情報を返す）
+    // フォールバック用のリンク情報を生成
+    const getFallbackLinkInfo = (url) => {
+        try {
+            return { title: new URL(url).hostname, description: '', imageUrl: '' };
+        } catch (e) {
+            return { title: 'Link', description: '', imageUrl: '' };
+        }
+    };
+
+    // 画像リサイズとアスペクト比情報を返す
     const resizeImageBlob = (blob, maxDimension, quality) => {
-        return new Promise((resolve, reject) => {
+        return new Promise((resolve) => {
             const canvas = document.createElement('canvas');
             const ctx = canvas.getContext('2d');
             const image = new Image();
 
             image.onload = () => {
                 URL.revokeObjectURL(url);
-                
                 let width = image.naturalWidth;
                 let height = image.naturalHeight;
-
-                // 元の画像サイズが小さい場合は拡大しない
                 const needsResize = width > maxDimension || height > maxDimension;
 
                 if (needsResize) {
-                    // アスペクト比を維持してリサイズ
                     if (width > height) {
                         height = Math.round((height * maxDimension) / width);
                         width = maxDimension;
@@ -118,122 +121,83 @@
 
                 canvas.width = width;
                 canvas.height = height;
-
-                // 高品質な描画設定
                 ctx.imageSmoothingEnabled = true;
                 ctx.imageSmoothingQuality = 'high';
-
-                // 背景を白で塗りつぶす（透過PNG対策）
                 ctx.fillStyle = '#FFFFFF';
                 ctx.fillRect(0, 0, width, height);
                 ctx.drawImage(image, 0, 0, width, height);
 
-                // toBlobでJPEGに変換し、品質を調整 (ファイルサイズを削減)
-                canvas.toBlob(
-                    (resultBlob) => {
-                        if (resultBlob) {
-                            console.log(`[X-to-Bluesky] Image resized: ${image.naturalWidth}x${image.naturalHeight} -> ${width}x${height}, size: ${Math.round(resultBlob.size / 1024)}KB`);
-                            // アスペクト比情報も一緒に返す
-                            resolve({
-                                blob: resultBlob,
-                                aspectRatio: {
-                                    width: width,
-                                    height: height
-                                }
-                            });
-                        } else {
-                            console.warn('[X-to-Bluesky] Failed to create blob, using original');
-                            resolve({
-                                blob: blob,
-                                aspectRatio: {
-                                    width: image.naturalWidth,
-                                    height: image.naturalHeight
-                                }
-                            });
-                        }
-                    },
-                    'image/jpeg',
-                    quality
-                );
+                canvas.toBlob((resultBlob) => {
+                    if (resultBlob) {
+                        console.log(`[X-to-Bluesky] Image resized: ${image.naturalWidth}x${image.naturalHeight} -> ${width}x${height}, size: ${Math.round(resultBlob.size / 1024)}KB`);
+                        resolve({ blob: resultBlob, aspectRatio: { width, height } });
+                    } else {
+                        console.warn('[X-to-Bluesky] Failed to create blob, using original');
+                        resolve({ blob, aspectRatio: { width: image.naturalWidth, height: image.naturalHeight } });
+                    }
+                }, 'image/jpeg', quality);
             };
 
             image.onerror = (error) => {
                 console.warn('[X-to-Bluesky] Failed to load image for resizing:', error);
-                // エラー時は元のblobとデフォルトのアスペクト比を返す
-                resolve({
-                    blob: blob,
-                    aspectRatio: { width: 1, height: 1 }
-                });
+                resolve({ blob, aspectRatio: { width: 1, height: 1 } });
             };
 
-            // Blob URLを作成して画像ソースに設定し、ロード後に解放
             const url = URL.createObjectURL(blob);
             image.src = url;
         });
     };
 
+    // OGPメタデータを取得
+    const getMetaContent = (doc, properties) => {
+        for (const prop of properties) {
+            const meta = doc.querySelector(`meta[property="${prop}"], meta[name="${prop}"]`);
+            const content = meta?.getAttribute('content');
+            if (content && content.trim()) {
+                console.log(`[X-to-Bluesky] Found ${prop}:`, content.trim());
+                return content.trim();
+            }
+        }
+        return '';
+    };
 
-    // URLからリンクカード情報を取得(GM_xmlhttpRequestでCORS回避)
+    // リンクカード情報を取得
     const fetchLinkCard = async (url) => {
         console.log('[X-to-Bluesky] Fetching link card for URL:', url);
-
         return new Promise((resolve) => {
+            const handleError = () => resolve(getFallbackLinkInfo(url));
+            
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: url,
+                timeout: 15000,
                 onload: (response) => {
                     console.log('[X-to-Bluesky] Response status:', response.status);
                     try {
-                        const html = response.responseText;
                         const parser = new DOMParser();
-                        const doc = parser.parseFromString(html, 'text/html');
+                        const doc = parser.parseFromString(response.responseText, 'text/html');
 
-                        // OGPメタデータ取得のヘルパー関数
-                        const getMetaContent = (properties) => {
-                            for (const prop of properties) {
-                                // property属性とname属性の両方をチェック
-                                const meta = doc.querySelector(`meta[property="${prop}"], meta[name="${prop}"]`);
-                                const content = meta?.getAttribute('content');
-                                // og:image:secure_url もチェックし、堅牢化
-                                if (content && content.trim()) {
-                                    console.log(`[X-to-Bluesky] Found ${prop}:`, content.trim());
-                                    return content.trim();
-                                }
-                            }
-                            return '';
-                        };
-
-                        // タイトルの取得(優先順位: og:title > twitter:title > title タグ > ドメイン名)
-                        let title = getMetaContent(['og:title', 'twitter:title']);
+                        let title = getMetaContent(doc, ['og:title', 'twitter:title']);
                         if (!title) {
                             const titleTag = doc.querySelector('title');
                             title = titleTag?.textContent?.trim() || '';
                             console.log('[X-to-Bluesky] Title tag:', title);
                         }
-
-                        // 最終フォールバック: ドメイン名を使用
                         if (!title) {
                             try {
-                                const urlObj = new URL(url);
-                                title = urlObj.hostname;
+                                title = new URL(url).hostname;
                                 console.log('[X-to-Bluesky] Using hostname as title:', title);
                             } catch (e) {
                                 title = 'Link';
-                                console.log('[X-to-Bluesky] Using fallback title: Link');
                             }
                         }
 
-                        // 説明文の取得(優先順位: og:description > twitter:description > description)
-                        let description = getMetaContent(['og:description', 'twitter:description', 'description']);
+                        let description = getMetaContent(doc, ['og:description', 'twitter:description', 'description']);
+                        let imageUrl = getMetaContent(doc, ['og:image', 'twitter:image', 'twitter:image:src', 'og:image:secure_url']);
 
-                        // 画像URLの取得(優先順位: og:image > twitter:image > twitter:image:src > og:image:secure_url)
-                        let imageUrl = getMetaContent(['og:image', 'twitter:image', 'twitter:image:src', 'og:image:secure_url']);
-
-                        // 相対URLを絶対URLに変換
                         if (imageUrl && !imageUrl.startsWith('http')) {
                             try {
-                                const baseUrl = new URL(url);
-                                imageUrl = new URL(imageUrl, baseUrl.origin).href;
+                                imageUrl = new URL(imageUrl, new URL(url).origin).href;
                                 console.log('[X-to-Bluesky] Resolved image URL:', imageUrl);
                             } catch (e) {
                                 console.warn('[X-to-Bluesky] Failed to resolve relative image URL:', e);
@@ -245,35 +209,17 @@
                         resolve({ title, description, imageUrl });
                     } catch (error) {
                         console.error('[X-to-Bluesky] Failed to parse link card data:', error);
-                        // パース失敗時は最低限の情報を返す
-                        try {
-                            const urlObj = new URL(url);
-                            resolve({ title: urlObj.hostname, description: '', imageUrl: '' });
-                        } catch (e) {
-                            resolve({ title: 'Link', description: '', imageUrl: '' });
-                        }
+                        handleError();
                     }
                 },
                 onerror: (error) => {
                     console.error('[X-to-Bluesky] Failed to fetch link card:', error);
-                    // エラー時も最低限の情報を返す
-                    try {
-                        const urlObj = new URL(url);
-                        resolve({ title: urlObj.hostname, description: '', imageUrl: '' });
-                    } catch (e) {
-                        resolve({ title: 'Link', description: '', imageUrl: '' });
-                    }
+                    handleError();
                 },
                 ontimeout: () => {
                     console.warn('[X-to-Bluesky] Link card fetch timeout');
-                    try {
-                        const urlObj = new URL(url);
-                        resolve({ title: urlObj.hostname, description: '', imageUrl: '' });
-                    } catch (e) {
-                        resolve({ title: 'Link', description: '', imageUrl: '' });
-                    }
-                },
-                timeout: 15000 // 15秒でタイムアウト
+                    handleError();
+                }
             });
         });
     };
@@ -285,7 +231,8 @@
                 const opts = {
                     method,
                     url: `${settings.pdsUrl}/xrpc/${endpoint}`,
-                    headers: {}, // ★★★ 修正: Content-Typeを初期化時に設定しない ★★★
+                    headers: {},
+                    timeout: 30000,
                     onload: (res) => {
                         const json = JSON.parse(res.responseText);
                         if (res.status >= 400 || json.error) {
@@ -295,26 +242,20 @@
                         }
                     },
                     onerror: (err) => reject(new Error(`${endpoint} failed: ${err.statusText}`)),
-                    ontimeout: () => reject(new Error(`${endpoint} timeout`)),
-                    timeout: 30000
+                    ontimeout: () => reject(new Error(`${endpoint} timeout`))
                 };
 
-                // ★★★ 修正: データのタイプに応じてヘッダーを設定 ★★★
                 if (data instanceof Blob) {
-                    // Blobの場合: Content-TypeをBlobのMIMEタイプに設定
                     opts.data = data;
                     opts.headers['Content-Type'] = data.type;
                 } else if (data !== null) {
-                    // JSONデータの場合
                     opts.data = JSON.stringify(data);
                     opts.headers['Content-Type'] = 'application/json';
                 } else {
-                    // GETなどデータがない場合
                     opts.headers['Content-Type'] = 'application/json';
                 }
 
                 if (settings.session) opts.headers.Authorization = `Bearer ${settings.session.accessJwt}`;
-
                 GM_xmlhttpRequest(opts);
             });
         },
@@ -374,10 +315,10 @@
         setTimeout(() => {
             notif.classList.add('fade-out');
             setTimeout(() => notif.remove(), 500);
-        }, 5000); // 通知時間を延長
+        }, 5000);
     };
 
-    // 設定パネル
+    // 設定パネルのトグル
     const toggleSettings = () => {
         if (settingsPanel) {
             settingsPanel.remove();
@@ -429,7 +370,7 @@
         };
     };
 
-    // UI要素追加
+    // 設定アイコンを追加
     const addSettingsIcon = (parent, mobile = false) => {
         const wrapper = document.createElement('div');
         wrapper.className = mobile ? 'bsky-settings-icon-wrapper' : 'bsky-nav';
@@ -442,6 +383,7 @@
         };
     };
 
+    // クロスポストコントロールを追加
     const addCrosspostControls = (toolbar) => {
         toolbar.classList.add('bsky-toolbar');
         const container = toolbar.parentElement;
@@ -485,7 +427,7 @@
         }
     };
 
-    // Buffer起動ヘルパー関数
+    // Buffer起動
     const openBuffer = () => {
         const isiPhone = isIPhone();
         const desktop = isDesktop();
@@ -510,24 +452,23 @@
 
         console.log('[X-to-Bluesky] Button clicked - UA:', navigator.userAgent);
 
-        // Buffer機能(左メニュー/右下の投稿ボタン)
+        // Buffer機能（サイドナビ/FABボタン）
         if (isSideNav && settings.bufferEnabled) {
             console.log('[X-to-Bluesky] Opening Buffer...');
             e.stopPropagation();
             e.preventDefault();
             e.stopImmediatePropagation();
-
             openBuffer();
             return;
         }
 
-        // Buffer機能が無効な場合、左メニュー/右下ボタンは標準動作(投稿モーダルを開く)
+        // Buffer無効時はサイドナビボタンは標準動作
         if (isSideNav) {
             console.log('[X-to-Bluesky] SideNav button - standard behavior');
             return;
         }
 
-        // Blueskyクロスポスト(投稿モーダル内の投稿ボタンのみ)
+        // Blueskyクロスポスト処理
         console.log('[X-to-Bluesky] Checking for Bluesky crosspost...');
         if (!settings.crosspostChecked || !settings.handle || !settings.password || isPosting) return;
 
@@ -556,7 +497,7 @@
                 facets: parseFacets(text)
             };
 
-            // 画像添付の処理
+            // 画像添付処理
             const attachments = document.querySelectorAll(SELECTORS.ATTACHMENTS);
             const videos = document.querySelectorAll(SELECTORS.VIDEO_ATTACHMENTS);
 
@@ -566,11 +507,8 @@
                     try {
                         const response = await fetch(img.src);
                         const blob = await response.blob();
-
-                        // ★★★ 画像リサイズ処理を適用 (ファイルサイズ超過対策) ★★★
                         console.log('[X-to-Bluesky] Resizing image for upload limit...');
                         const resizedResult = await resizeImageBlob(blob, MAX_IMAGE_DIMENSION, IMAGE_COMPRESSION_QUALITY);
-
                         const uploaded = await bskyAPI.uploadBlob(resizedResult.blob);
                         images.push({ 
                             alt: img.alt || '', 
@@ -579,10 +517,9 @@
                         });
                         console.log('[X-to-Bluesky] Image uploaded successfully after resize.');
                     } catch (err) {
-                        console.error('Failed to upload image (even after resize):', err);
+                        console.error('Failed to upload image:', err);
                         const errorMessage = err.message.includes('file too large') ?
-                                             'Upload failed: File size too large (max ~1MB).' :
-                                             err.message;
+                                             'Upload failed: File size too large (max ~1MB).' : err.message;
                         showNotification(`Image upload failed: ${errorMessage}. Skipping image.`, true);
                     }
                 }
@@ -590,34 +527,26 @@
                     record.embed = { $type: 'app.bsky.embed.images', images };
                 }
             } else if (videos.length > 0) {
-                // 動画添付の処理(努力目標 - 最初の動画のみ)
+                // 動画添付処理（最初の1つのみ）
                 try {
                     const video = videos[0];
                     const response = await fetch(video.src);
                     const blob = await response.blob();
-
-                    // 動画はリサイズが複雑なため、Blobサイズが1MB未満であることを期待してそのままアップロード
                     const uploaded = await bskyAPI.uploadBlob(blob);
-
-                    record.embed = {
-                        $type: 'app.bsky.embed.video',
-                        video: uploaded
-                    };
+                    record.embed = { $type: 'app.bsky.embed.video', video: uploaded };
                     console.log('[X-to-Bluesky] Video uploaded successfully.');
                 } catch (err) {
                     console.error('Failed to upload video:', err);
                     const errorMessage = err.message.includes('file too large') ?
-                                         'Upload failed: Video size too large (max ~1MB).' :
-                                         err.message;
+                                         'Upload failed: Video size too large (max ~1MB).' : err.message;
                     showNotification(`Video upload failed: ${errorMessage}. Skipping video.`, true);
                 }
             } else {
-                // リンクカードの処理(画像・動画がない場合、テキスト内のURLを検出)
+                // リンクカード処理
                 const urlRegex = /(https?:\/\/[^\s]+)/g;
                 const urls = text.match(urlRegex);
 
                 if (urls && urls.length > 0) {
-                    // 最初のURLに対してリンクカードを生成
                     const url = urls[0];
                     console.log('[X-to-Bluesky] Found URL in text:', url);
 
@@ -625,28 +554,22 @@
                         const cardData = await fetchLinkCard(url);
                         console.log('[X-to-Bluesky] Card data received:', cardData);
 
-                        // タイトルが存在すればリンクカードを作成
                         if (cardData && cardData.title) {
                             const external = {
                                 uri: url,
-                                // 最大長を考慮
                                 title: cardData.title.substring(0, 300),
                                 description: cardData.description.substring(0, 1000)
                             };
 
-                            // サムネイル画像のアップロード(あれば)
+                            // サムネイル画像のアップロード
                             if (cardData.imageUrl) {
                                 try {
                                     console.log('[X-to-Bluesky] Uploading thumbnail:', cardData.imageUrl);
                                     const imgResponse = await fetch(cardData.imageUrl);
                                     if (imgResponse.ok) {
                                         const imgBlob = await imgResponse.blob();
-
-                                        // ★★★ サムネイル画像リサイズ処理を適用 ★★★
                                         console.log('[X-to-Bluesky] Resizing thumbnail image...');
-                                        // サムネイルは小さめ(例: 600px)で圧縮率を少し高めに
                                         const resizedThumbResult = await resizeImageBlob(imgBlob, 600, 0.7);
-
                                         const thumbBlob = await bskyAPI.uploadBlob(resizedThumbResult.blob);
                                         external.thumb = thumbBlob;
                                         console.log('[X-to-Bluesky] Thumbnail uploaded successfully after resize');
@@ -655,26 +578,21 @@
                                     }
                                 } catch (err) {
                                     console.warn('[X-to-Bluesky] Failed to upload thumbnail:', err);
-                                    // サムネイルなしでも続行
                                 }
                             }
 
-                            record.embed = {
-                                $type: 'app.bsky.embed.external',
-                                external
-                            };
+                            record.embed = { $type: 'app.bsky.embed.external', external };
                             console.log('[X-to-Bluesky] Link card embed created successfully:', record.embed);
                         } else {
                             console.warn('[X-to-Bluesky] No title found, skipping link card');
                         }
                     } catch (err) {
                         console.error('[X-to-Bluesky] Failed to create link card:', err);
-                        // リンクカード作成失敗でも投稿は続行
                     }
                 }
             }
 
-            // 引用投稿の処理
+            // 引用投稿処理
             if (quoteLink?.href) {
                 text += `\n${quoteLink.href}`;
                 record.text = text;
@@ -686,13 +604,11 @@
         } catch (error) {
             console.error('Crosspost failed:', error);
             const errorMessage = error.message.includes('file too large') ?
-                                 'Upload failed: File size too large (max ~1MB).' :
-                                 error.message;
+                                 'Upload failed: File size too large (max ~1MB).' : error.message;
             showNotification(`Failed: ${errorMessage}`, true);
         } finally {
             btn.innerHTML = originalHTML;
             btn.disabled = false;
-            // Xの投稿ボタンを再度クリックし、X側での投稿を完了させる
             btn.click();
             isPosting = false;
         }
@@ -707,7 +623,6 @@
             if (!toolbar.querySelector('.bsky-crosspost-checkbox')) addCrosspostControls(toolbar);
         });
 
-        // 投稿ボタンにリスナーを再確認
         document.querySelectorAll(SELECTORS.POST_BUTTON).forEach(btn => {
             if (!btn.hasAttribute('data-bsky-listener')) {
                 btn.addEventListener('click', handlePost, true);
@@ -723,7 +638,7 @@
         });
     });
 
-    // CSS
+    // スタイル定義
     GM_addStyle(`
         .bsky-nav { padding: 12px; cursor: pointer; }
         .bsky-nav a { width: 1.75rem; height: 1.75rem; background: url(${ICON}) no-repeat center/cover; display: block; }
