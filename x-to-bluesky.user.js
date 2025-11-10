@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         x-to-bluesky
-// @version      1.0b
-// @description  Crosspost from X (formerly Twitter) to Bluesky with link cards, images, and videos (Enhanced: Image Resize & Content-Type Fix)
+// @version      1.0b2
+// @description  Crosspost from X (formerly Twitter) to Bluesky with link cards, images, and videos (Enhanced: Image Resize & Content-Type Fix & ALT Text Support)
 // @author       imgddotnet (Modified by Gemini & Claude)
 // @license      MIT
 // @namespace    imgddotnet
@@ -15,7 +15,6 @@
 // @connect      bsky.social
 // @connect      *
 // @run-at       document-end
-// @inject-into  page
 // ==/UserScript==
 
 (function() {
@@ -28,21 +27,27 @@
         POST_TOOLBAR: 'div[data-testid="toolBar"]:not(.bsky-toolbar)',
         POST_BUTTON: '[data-testid="tweetButton"], [data-testid="tweetButtonInline"]',
         SIDE_NAV_POST_BUTTON: '[data-testid="SideNav_NewTweet_Button"], a[href="/compose/post"], a[href="/compose/tweet"], a[aria-label*="Post"]',
-        MOBILE_FAB_BUTTON: 'a[href="/compose/post"], a[href="/compose/tweet"]',
         TEXT_AREA: '[data-testid="tweetTextarea_0"]',
         ATTACHMENTS: 'div[data-testid="attachments"] img',
         VIDEO_ATTACHMENTS: 'div[data-testid="attachments"] video',
         QUOTE_LINK: '[data-testid="tweetEditor"] [data-testid^="card.layout"] a[href*="/status/"]'
     };
 
-    const BUFFER_URL = 'https://publish.buffer.com/compose?';
-    const BUFFER_UNIVERSAL_LINK = 'https://buffer.com/app/compose';
-    const POPUP_WIDTH = 600;
-    const POPUP_HEIGHT = 800;
-    const VERSION = 'v1.0b';
-    const ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzU3OUZENiIgZD0iTTEyIDEuNjkybC01LjY5MiA5LjY5Mmw1LjY5MiA5LjY5Mmw1LjY5Mi05LjY5MnoiLz48L3N2Zz4=';
-    const MAX_IMAGE_DIMENSION = 1024;
-    const IMAGE_COMPRESSION_QUALITY = 0.8;
+    // 定数の統合 (削減案1)
+    const CONFIG = {
+        VERSION: 'v1.0b2',
+        ICON_SVG: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzU3OUZENiIgZD0iTTEyIDEuNjkybC01LjY5MiA5LjY5Mmw1LjY5MiA5LjY5Mmw1LjY5Mi05LjY5MnoiLz48L3N2Zz4=',
+        BUFFER: {
+            URL: 'https://publish.buffer.com/compose?',
+            UNIVERSAL_LINK: 'https://buffer.com/app/compose',
+            POPUP_WIDTH: 600,
+            POPUP_HEIGHT: 800
+        },
+        IMAGE: {
+            MAX_DIMENSION: 1024,
+            COMPRESSION_QUALITY: 0.8
+        }
+    };
 
     // 設定管理
     let settings = {
@@ -79,13 +84,6 @@
         });
         return facets;
     };
-
-    const isIPhone = () => {
-        const ua = navigator.userAgent;
-        return (/iPhone/i.test(ua) || /iPod/i.test(ua)) && !/iPad/i.test(ua);
-    };
-
-    const isDesktop = () => document.querySelector(SELECTORS.NAV_BAR) !== null;
 
     // フォールバック用のリンク情報を生成
     const getFallbackLinkInfo = (url) => {
@@ -148,6 +146,18 @@
         });
     };
 
+    // 画像のALTテキストを取得
+    const getImageAltText = (img) => {
+        const groupDiv = img.closest('div[role="group"][aria-label]');
+        if (groupDiv) {
+            const altText = groupDiv.getAttribute('aria-label');
+            if (altText && altText !== '画像の説明を読む') {
+                return altText;
+            }
+        }
+        return '';
+    };
+
     // OGPメタデータを取得
     const getMetaContent = (doc, properties) => {
         for (const prop of properties) {
@@ -166,7 +176,7 @@
         console.log('[X-to-Bluesky] Fetching link card for URL:', url);
         return new Promise((resolve) => {
             const handleError = () => resolve(getFallbackLinkInfo(url));
-            
+
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: url,
@@ -224,40 +234,42 @@
         });
     };
 
+    // GM_xmlhttpRequestをPromiseでラップするヘルパー関数 (削減案2)
+    const gmXhrPromise = (opts, endpoint) => new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+            ...opts,
+            onload: (res) => {
+                if (res.status >= 200 && res.status < 300) {
+                    try { resolve(JSON.parse(res.responseText)); } catch { resolve(res.responseText); } 
+                } else {
+                    try {
+                        const json = JSON.parse(res.responseText);
+                        reject(new Error(json.message || `API Error: ${res.status} ${endpoint}`));
+                    } catch {
+                        reject(new Error(`API Error: ${res.status} ${endpoint}`));
+                    }
+                }
+            },
+            onerror: (err) => reject(new Error(`${endpoint} failed: ${err.statusText}`)),
+            ontimeout: () => reject(new Error(`${endpoint} timeout`))
+        });
+    });
+
     // Bluesky API
     const bskyAPI = {
         async request(method, endpoint, data = null) {
-            return new Promise((resolve, reject) => {
-                const opts = {
-                    method,
-                    url: `${settings.pdsUrl}/xrpc/${endpoint}`,
-                    headers: {},
-                    timeout: 30000,
-                    onload: (res) => {
-                        const json = JSON.parse(res.responseText);
-                        if (res.status >= 400 || json.error) {
-                            reject(new Error(json.message || `API Error: ${res.status} ${endpoint}`));
-                        } else {
-                             resolve(json);
-                        }
-                    },
-                    onerror: (err) => reject(new Error(`${endpoint} failed: ${err.statusText}`)),
-                    ontimeout: () => reject(new Error(`${endpoint} timeout`))
-                };
-
-                if (data instanceof Blob) {
-                    opts.data = data;
-                    opts.headers['Content-Type'] = data.type;
-                } else if (data !== null) {
-                    opts.data = JSON.stringify(data);
-                    opts.headers['Content-Type'] = 'application/json';
-                } else {
-                    opts.headers['Content-Type'] = 'application/json';
-                }
-
-                if (settings.session) opts.headers.Authorization = `Bearer ${settings.session.accessJwt}`;
-                GM_xmlhttpRequest(opts);
-            });
+            const opts = { method, url: `${settings.pdsUrl}/xrpc/${endpoint}`, headers: {}, timeout: 30000 };
+            if (data instanceof Blob) {
+                opts.data = data;
+                opts.headers['Content-Type'] = data.type;
+            } else if (data !== null) {
+                opts.data = JSON.stringify(data);
+                opts.headers['Content-Type'] = 'application/json';
+            } else {
+                opts.headers['Content-Type'] = 'application/json';
+            }
+            if (settings.session) opts.headers.Authorization = `Bearer ${settings.session.accessJwt}`;
+            return gmXhrPromise(opts, endpoint);
         },
 
         async login() {
@@ -295,14 +307,19 @@
         }
     };
 
-    // 通知表示
+    // 通知表示（簡略化適用）
     const showNotification = (text, isError = false) => {
-        const existing = document.getElementById('bsky-notification');
-        if (existing) existing.remove();
+        let notif = document.getElementById('bsky-notification');
+        
+        // 既存の通知があれば削除
+        if (notif) notif.remove();
 
-        const notif = document.createElement('div');
+        notif = document.createElement('div');
         notif.id = 'bsky-notification';
+        
+        // クラスの付け替えのみに集中
         notif.className = `bsky-notification ${isError ? 'error' : 'success'}`;
+        
         notif.innerHTML = `
             <div class="bsky-notification-icon"></div>
             <div class="bsky-notification-content">
@@ -314,7 +331,7 @@
 
         setTimeout(() => {
             notif.classList.add('fade-out');
-            setTimeout(() => notif.remove(), 500);
+            setTimeout(() => notif.remove(), 500); // アニメーション後にDOMから削除
         }, 5000);
     };
 
@@ -343,7 +360,7 @@
                 <label for="buffer-toggle">Open Buffer post window</label>
             </div>
             <div class="settings-actions">
-                <div class="version">${VERSION}</div>
+                <div class="version">${CONFIG.VERSION}</div>
                 <button>Save</button>
             </div>
         `;
@@ -360,6 +377,7 @@
             GM_setValue('bsky_app_password', settings.password);
             GM_setValue('buffer_popup_enabled', settings.bufferEnabled);
 
+            // ESLint警告の修正 (修正案4)
             document.querySelectorAll('.bsky-crosspost-checkbox input').forEach(el => {
                 el.checked = settings.crosspostChecked;
                 el.disabled = !(settings.handle && settings.password);
@@ -388,7 +406,9 @@
         toolbar.classList.add('bsky-toolbar');
         const container = toolbar.parentElement;
         const postBtn = container?.querySelector(SELECTORS.POST_BUTTON);
-        const desktop = isDesktop();
+        
+        // isDesktopのインライン化 (削減案2)
+        const desktop = document.querySelector(SELECTORS.NAV_BAR) !== null;
 
         const checkbox = document.createElement('label');
         checkbox.className = 'bsky-crosspost-checkbox';
@@ -400,7 +420,11 @@
         checkbox.querySelector('input').onchange = (e) => {
             settings.crosspostChecked = e.target.checked;
             GM_setValue('bsky_crosspost_checked', settings.crosspostChecked);
-            document.querySelectorAll('.bsky-crosspost-checkbox input').forEach(el => el.checked = settings.crosspostChecked);
+            
+            // ESLint警告の修正 (修正案4)
+            document.querySelectorAll('.bsky-crosspost-checkbox input').forEach(el => {
+                el.checked = settings.crosspostChecked;
+            });
         };
 
         const controls = document.createElement('div');
@@ -429,26 +453,24 @@
 
     // Buffer起動
     const openBuffer = () => {
-        const isiPhone = isIPhone();
-        const desktop = isDesktop();
+        // isIPhoneとisDesktopのロジックをインライン化し、モバイル/デスクトップを判定 (削減案2)
+        const isMobile = ((/iPhone/i.test(navigator.userAgent) || /iPod/i.test(navigator.userAgent)) && !/iPad/i.test(navigator.userAgent)) || document.querySelector(SELECTORS.NAV_BAR) === null;
 
-        if (isiPhone || !desktop) {
+        if (isMobile) {
             console.log('[X-to-Bluesky] Opening Buffer via Universal Link');
-            window.location.href = BUFFER_UNIVERSAL_LINK;
+            window.location.href = CONFIG.BUFFER.UNIVERSAL_LINK;
         } else {
             console.log('[X-to-Bluesky] Opening Buffer popup for desktop');
             const w = window.innerWidth, h = window.innerHeight;
-            const x = (window.screenX || window.screenLeft) + (w - POPUP_WIDTH) / 2;
-            const y = (window.screenY || window.screenTop) + (h - POPUP_HEIGHT) / 2;
-            window.open(BUFFER_URL, '_blank', `width=${POPUP_WIDTH},height=${POPUP_HEIGHT},left=${x},top=${y}`);
+            const x = (window.screenX || window.screenLeft) + (w - CONFIG.BUFFER.POPUP_WIDTH) / 2;
+            const y = (window.screenY || window.screenTop) + (h - CONFIG.BUFFER.POPUP_HEIGHT) / 2;
+            window.open(CONFIG.BUFFER.URL, '_blank', `width=${CONFIG.BUFFER.POPUP_WIDTH},height=${CONFIG.BUFFER.POPUP_HEIGHT},left=${x},top=${y}`);
         }
     };
 
     // 投稿処理
     const handlePost = async (e) => {
         const isSideNav = e.target.closest(SELECTORS.SIDE_NAV_POST_BUTTON);
-        const isiPhone = isIPhone();
-        const desktop = isDesktop();
 
         console.log('[X-to-Bluesky] Button clicked - UA:', navigator.userAgent);
 
@@ -508,12 +530,14 @@
                         const response = await fetch(img.src);
                         const blob = await response.blob();
                         console.log('[X-to-Bluesky] Resizing image for upload limit...');
-                        const resizedResult = await resizeImageBlob(blob, MAX_IMAGE_DIMENSION, IMAGE_COMPRESSION_QUALITY);
+                        const resizedResult = await resizeImageBlob(blob, CONFIG.IMAGE.MAX_DIMENSION, CONFIG.IMAGE.COMPRESSION_QUALITY);
                         const uploaded = await bskyAPI.uploadBlob(resizedResult.blob);
-                        images.push({ 
-                            alt: img.alt || '', 
+                        const altText = getImageAltText(img);
+                        console.log('[X-to-Bluesky] ALT text:', altText || '(none)');
+                        images.push({
+                            alt: altText,
                             image: uploaded,
-                            aspectRatio: resizedResult.aspectRatio 
+                            aspectRatio: resizedResult.aspectRatio
                         });
                         console.log('[X-to-Bluesky] Image uploaded successfully after resize.');
                     } catch (err) {
@@ -614,71 +638,236 @@
         }
     };
 
-    // DOM監視
+    // DOM監視（スロットリング付き）
+    let observerTimeout;
     const observer = new MutationObserver(() => {
-        const navbar = document.querySelector(SELECTORS.BSKY_NAV);
-        if (navbar && !navbar.querySelector('.bsky-nav')) addSettingsIcon(navbar);
+        clearTimeout(observerTimeout);
+        observerTimeout = setTimeout(() => {
+            const navbar = document.querySelector(SELECTORS.BSKY_NAV);
+            if (navbar && !navbar.querySelector('.bsky-nav')) addSettingsIcon(navbar);
 
-        document.querySelectorAll(SELECTORS.POST_TOOLBAR).forEach(toolbar => {
-            if (!toolbar.querySelector('.bsky-crosspost-checkbox')) addCrosspostControls(toolbar);
-        });
+            document.querySelectorAll(SELECTORS.POST_TOOLBAR).forEach(toolbar => {
+                if (!toolbar.querySelector('.bsky-crosspost-checkbox')) addCrosspostControls(toolbar);
+            });
 
-        document.querySelectorAll(SELECTORS.POST_BUTTON).forEach(btn => {
-            if (!btn.hasAttribute('data-bsky-listener')) {
-                btn.addEventListener('click', handlePost, true);
-                btn.setAttribute('data-bsky-listener', 'true');
-            }
-        });
+            document.querySelectorAll(SELECTORS.POST_BUTTON).forEach(btn => {
+                if (!btn.hasAttribute('data-bsky-listener')) {
+                    btn.addEventListener('click', handlePost, true);
+                    btn.setAttribute('data-bsky-listener', 'true');
+                }
+            });
 
-        document.querySelectorAll(SELECTORS.SIDE_NAV_POST_BUTTON).forEach(btn => {
-            if (!btn.hasAttribute('data-bsky-listener')) {
-                btn.addEventListener('click', handlePost, true);
-                btn.setAttribute('data-bsky-listener', 'true');
-            }
-        });
+            document.querySelectorAll(SELECTORS.SIDE_NAV_POST_BUTTON).forEach(btn => {
+                if (!btn.hasAttribute('data-bsky-listener')) {
+                    btn.addEventListener('click', handlePost, true);
+                    btn.setAttribute('data-bsky-listener', 'true');
+                }
+            });
+        }, 100);
     });
 
-    // スタイル定義
-    GM_addStyle(`
-        .bsky-nav { padding: 12px; cursor: pointer; }
-        .bsky-nav a { width: 1.75rem; height: 1.75rem; background: url(${ICON}) no-repeat center/cover; display: block; }
-        @media (min-width: 1000px) {
-            .bsky-nav a:after { content: "Crosspost"; margin-left: 46px; color: rgb(15, 20, 25); font-family: system-ui; }
-        }
-        .bsky-settings-icon-wrapper { display: inline-block; margin-right: 12px; }
-        .bsky-settings-icon-wrapper a { width: 28px; height: 28px; background: url(${ICON}) no-repeat center/cover; display: block; border-radius: 50%; }
-        .bsky-controls-container { display: flex; align-items: center; flex-grow: 1; order: -1; }
-        @media (min-width: 1000px) { .bsky-controls-container { justify-content: flex-end; } }
-        .bsky-crosspost-checkbox { display: inline-flex; align-items: center; margin-right: 12px; }
-        .bsky-crosspost-checkbox input { margin-right: 4px; cursor: pointer; }
-        .bsky-crosspost-checkbox span { font: 14px system-ui; cursor: pointer; }
-        .bsky-crosspost-checkbox input:disabled + span { color: #888; cursor: default; }
-        .bsky-post-status-text { font: 12px system-ui; display: block; line-height: 38px; text-align: center; color: #fff !important; }
-        .bsky-notification { position: fixed; top: 12px; right: 50%; transform: translateX(50%); display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: rgb(29, 155, 240); color: white; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); font-family: system-ui; max-width: 320px; width: 90%; z-index: 99999; transition: opacity 0.5s, transform 0.5s; }
-        .bsky-notification.error { background: rgb(244, 33, 46); }
-        .bsky-notification.fade-out { opacity: 0; transform: translateX(50%) translateY(-100%); }
-        .bsky-notification-icon { width: 20px; height: 20px; background: url(${ICON}) no-repeat center/cover; filter: brightness(0) invert(1); }
-        .bsky-notification-content { line-height: 1.3; }
-        .bsky-notification-title { font-weight: bold; font-size: 14px; }
-        .bsky-notification-text { font-size: 13px; }
-        @media (min-width: 501px) { .bsky-notification { width: 500px; max-width: 500px; } }
-        .bsky-settings { position: fixed; width: 300px; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #fff; padding: 15px; border: 2px solid #0085FF; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); font: 14px system-ui; z-index: 10000; display: flex; flex-direction: column; gap: 10px; }
-        .bsky-settings fieldset { border: 1px solid #ccc; padding: 10px; border-radius: 4px; display: flex; flex-direction: column; gap: 8px; }
-        .bsky-settings legend { font-weight: bold; padding: 0 5px; }
-        .bsky-settings label { font-weight: 500; }
-        .bsky-settings input[type="text"], .bsky-settings input[type="url"], .bsky-settings input[type="password"] { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-        .bsky-settings .settings-actions { display: flex; justify-content: space-between; align-items: center; }
-        .bsky-settings button { padding: 8px 16px; border: none; background: #1d9bf0; color: white; border-radius: 9999px; font-weight: bold; cursor: pointer; }
-        .bsky-settings button:hover { background: #1a8cd8; }
-        .bsky-settings .version { font-size: 12px; color: #888; }
-        .bsky-settings .checkbox-group { display: flex; align-items: center; gap: 8px; }
-        @media (prefers-color-scheme: dark) {
-            .bsky-nav a:after { color: rgb(247, 249, 249); }
-            .bsky-settings { background: #000; color: #fff; border-color: #0055AA; }
-            .bsky-settings fieldset { border-color: #444; }
-            .bsky-settings input { background: #333; border-color: #555; color: #fff; }
-        }
-    `);
+    // スタイル定義（共通化と整理 - 削減案3）
+    const ICON_SVG = CONFIG.ICON_SVG;
+
+GM_addStyle(`
+.bsky-nav {
+    padding: 12px;
+    cursor: pointer;
+}
+/* アイコンの共通設定 */
+.bsky-nav a,
+.bsky-settings-icon-wrapper a,
+.bsky-notification-icon {
+    background: url(${ICON_SVG}) no-repeat center/cover;
+    display: block;
+}
+.bsky-nav a {
+    width: 1.75rem;
+    height: 1.75rem;
+}
+.bsky-settings-icon-wrapper {
+    display: inline-block;
+    margin-right: 12px;
+}
+.bsky-settings-icon-wrapper a {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+}
+.bsky-controls-container {
+    display: flex;
+    align-items: center;
+    flex-grow: 1;
+    order: -1;
+}
+.bsky-crosspost-checkbox {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 12px;
+}
+.bsky-crosspost-checkbox input {
+    margin-right: 4px;
+    cursor: pointer;
+}
+.bsky-crosspost-checkbox span {
+    font: 14px system-ui;
+    cursor: pointer;
+}
+.bsky-crosspost-checkbox input:disabled + span {
+    color: #888;
+    cursor: default;
+}
+.bsky-post-status-text {
+    font: 12px system-ui;
+    display: block;
+    line-height: 38px;
+    text-align: center;
+    color: #fff !important;
+}
+.bsky-notification {
+    position: fixed;
+    top: 12px;
+    right: 50%;
+    transform: translateX(50%);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    background: rgb(29, 155, 240);
+    color: #fff;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    font-family: system-ui;
+    max-width: 320px;
+    width: 90%;
+    z-index: 99999;
+    transition: opacity 0.5s, transform 0.5s;
+}
+.bsky-notification.error {
+    background: rgb(244, 33, 46);
+}
+.bsky-notification.fade-out {
+    opacity: 0;
+    transform: translateX(50%) translateY(-100%);
+}
+.bsky-notification-icon {
+    width: 20px;
+    height: 20px;
+    filter: brightness(0) invert(1);
+}
+.bsky-notification-content {
+    line-height: 1.3;
+}
+.bsky-notification-title {
+    font-weight: 700;
+    font-size: 14px;
+}
+.bsky-notification-text {
+    font-size: 13px;
+}
+.bsky-settings {
+    position: fixed;
+    width: 300px;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: #fff;
+    padding: 15px;
+    border: 2px solid #0085ff;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    font: 14px system-ui;
+    z-index: 10000;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.bsky-settings fieldset {
+    border: 1px solid #ccc;
+    padding: 10px;
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.bsky-settings legend {
+    font-weight: 700;
+    padding: 0 5px;
+}
+.bsky-settings label {
+    font-weight: 500;
+}
+.bsky-settings input[type="text"],
+.bsky-settings input[type="url"],
+.bsky-settings input[type="password"] {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-sizing: border-box;
+}
+.bsky-settings .settings-actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.bsky-settings button {
+    padding: 8px 16px;
+    border: none;
+    background: #1d9bf0;
+    color: #fff;
+    border-radius: 9999px;
+    font-weight: 700;
+    cursor: pointer;
+}
+.bsky-settings button:hover {
+    background: #1a8cd8;
+}
+.bsky-settings .version {
+    font-size: 12px;
+    color: #888;
+}
+.bsky-settings .checkbox-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+@media (min-width: 1280px) {
+    .bsky-nav a:after {
+        content: "Crosspost";
+        margin-left: 46px;
+        color: rgb(15, 20, 25);
+        font-family: system-ui;
+    }
+    .bsky-controls-container {
+        justify-content: flex-end;
+    }
+}
+@media (min-width: 501px) {
+    .bsky-notification {
+        width: 500px;
+        max-width: 500px;
+    }
+}
+@media (prefers-color-scheme: dark) {
+    .bsky-nav a:after {
+        color: rgb(247, 249, 249);
+    }
+    .bsky-settings {
+        background: #000;
+        color: #fff;
+        border-color: #0055aa;
+    }
+    .bsky-settings fieldset {
+        border-color: #444;
+    }
+    .bsky-settings input {
+        background: #333;
+        border-color: #555;
+        color: #fff;
+    }
+}
+`);
 
     observer.observe(document.body, { childList: true, subtree: true });
 })();
