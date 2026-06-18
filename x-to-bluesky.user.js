@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         x-to-bluesky
-// @version      2.0b2
+// @version      2.0b4
 // @description  Crosspost from X to Bluesky
-// @author       imgddotnet
+// @author       imgddotnet (Enhanced Claude/Gemini)
 // @license      MIT
 // @namespace    imgddotnet
 // @match        htt*://*x.com/*
@@ -21,9 +21,7 @@
 (function () {
     'use strict';
 
-    // ─────────────────────────────
-    // CONFIG & SELECTORS
-    // ─────────────────────────────
+    // Configuration and Selectors
     const SELECTORS = {
         NAV_BAR: 'nav[role="navigation"]',
         POST_TOOLBAR: 'div[data-testid="toolBar"]',
@@ -40,7 +38,7 @@
     };
 
     const CONFIG = {
-        VERSION: '2.0b2',
+        VERSION: '2.0b4',
         TIMEOUT: { DEFAULT: 60000, PARSER: 15000, VIDEO_FETCH: 120000, VIDEO_UPLOAD: 180000 },
         IMAGE: { MAX_DIMENSION: 4000, MAX_SIZE: 975000, COMPRESSION_QUALITY: 0.85, THUMB_DIMENSION: 800 },
         VIDEO: { MAX_SIZE: 300 * 1024 * 1024, UPLOAD_ENDPOINT: 'https://video.bsky.app/xrpc/app.bsky.video.uploadVideo', JOB_STATUS_ENDPOINT: 'https://video.bsky.app/xrpc/app.bsky.video.getJobStatus', POLL_INTERVAL_MS: 2000, POLL_MAX_ATTEMPTS: 180 }
@@ -57,9 +55,7 @@
 
     let settingsPanel = null, isCurrentlyBridging = false;
 
-    // ─────────────────────────────
-    // UTILITIES
-    // ─────────────────────────────
+    // Utilities
     const getByteLength = str => new TextEncoder().encode(str).length;
 
     const parseFacets = text => {
@@ -113,56 +109,35 @@
         objectUrl = URL.createObjectURL(blob); image.src = objectUrl;
     });
 
-    // ─────────────────────────────
-    // サムネイル取得（Blogger URL 正規化 + リトライ対応）
-    // ─────────────────────────────
-
     const normalizeBloggerImageUrl = (url) => {
         try {
-            // /w1200-h630-p-k-no-nu/ など複雑なフィルタ → /s800/
             const complexFilter = url.replace(/\/w\d+[^/]*\//, '/s800/');
             if (complexFilter !== url) return complexFilter;
-            // /s400/ など単純なサイズ指定 → /s800/
             const simpleSize = url.replace(/\/s\d+\//, '/s800/');
             if (simpleSize !== url) return simpleSize;
         } catch {}
-        return null; // Blogger URL でなければ null
+        return null;
     };
 
     const fetchThumbSafely = async (url, timeoutMs = CONFIG.TIMEOUT.DEFAULT) => {
-        // まず元の URL で試みる
-        try {
-            return await fetchBlobSafely(url, timeoutMs);
-        } catch (e) {
-            // 失敗 & Blogger URL なら正規化してリトライ
+        try { return await fetchBlobSafely(url, timeoutMs); }
+        catch (e) {
             const normalized = normalizeBloggerImageUrl(url);
-            if (normalized && normalized !== url) {
-                console.info('[x-to-bluesky] Blogger URL normalized, retrying:', normalized);
-                return await fetchBlobSafely(normalized, timeoutMs);
-            }
-            throw e; // それ以外はそのまま投げる
+            if (normalized && normalized !== url) return await fetchBlobSafely(normalized, timeoutMs);
+            throw e;
         }
     };
 
-    // ─────────────────────────────
-    // 【第2層】OGP / Twitter Card 直接取得
-    // ─────────────────────────────
+    // Embed processing
     const fetchLinkCard = (url) => new Promise((resolve) => {
         const reqHeaders = { 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' };
-
         GM_xmlhttpRequest({
-            method: 'GET',
-            url: url,
-            timeout: CONFIG.TIMEOUT.PARSER,
-            headers: reqHeaders,
+            method: 'GET', url: url, timeout: CONFIG.TIMEOUT.PARSER, headers: reqHeaders,
             onload: res => {
                 try {
                     if (res.status < 200 || res.status >= 300) { resolve(null); return; }
                     const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
                     const domain = new URL(url).hostname;
-
-                    // メタタグから値を取得するヘルパー
-                    // Twitter Card → OGP → フォールバック の優先順位で取得
                     const getMeta = (...props) => {
                         for (const p of props) {
                             const el = doc.querySelector(`meta[name="${p}"], meta[property="${p}"]`);
@@ -171,207 +146,106 @@
                         }
                         return '';
                     };
-
-                    // タイトル: twitter:title → og:title → <title>タグ の順
-                    const title = getMeta('twitter:title', 'og:title')
-                        || doc.querySelector('title')?.textContent?.trim()
-                        || domain;
-
-                    // description: twitter:description → og:description → description の順
+                    const title = getMeta('twitter:title', 'og:title') || doc.querySelector('title')?.textContent?.trim() || domain;
                     const description = getMeta('twitter:description', 'og:description', 'description');
-
-                    // 画像: twitter:image → og:image の順（相対URLは絶対URLに変換）
                     let imageUrl = getMeta('twitter:image', 'twitter:image:src', 'og:image');
                     if (imageUrl && !imageUrl.startsWith('http')) {
                         try { imageUrl = new URL(imageUrl, new URL(url).origin).href; } catch { imageUrl = ''; }
                     }
-
                     if (!title || title === domain) { resolve(null); return; }
                     resolve({ title, description, imageUrl });
                 } catch (e) { resolve(null); }
             },
-            onerror: () => resolve(null),
-            ontimeout: () => resolve(null)
+            onerror: () => resolve(null), ontimeout: () => resolve(null)
         });
     });
 
-    // ─────────────────────────────
-    // 【3層フェイルセーフ】リンクカード生成
-    // ─────────────────────────────
     const processExternalEmbed = async (targetUrl, updateStatus, editorElement) => {
         try {
             const domain = new URL(targetUrl).hostname;
             if (domain.includes('x.com') || domain.includes('twitter.com')) return null;
-
             updateStatus('Card...');
-
-            // 第1層で取得した画像（blob: URL）を保持するための変数
-            let layer1ImageBlob = null;
-            // 第1層の抽出結果（title・description）
-            let layer1Title = '';
-            let layer1Description = '';
-            let layer1ImageHttpUrl = '';
-
+            let layer1ImageBlob = null, layer1Title = '', layer1Description = '', layer1ImageHttpUrl = '';
+            
             if (editorElement) {
                 const xCardContainer = editorElement.querySelector(SELECTORS.X_CARD_CONTAINER);
                 if (xCardContainer) {
-
-                    // large card / small card 両方に対応するセレクター
-                    const cardLink = xCardContainer.querySelector(
-                        'div[data-testid="card.layoutLarge.media"] > a[rel][aria-label], ' +
-                        'div[data-testid="card.layoutSmall.media"] > a[rel][aria-label], ' +
-                        'a[data-testid="card.wrapper"] > div > a[rel][aria-label]'
-                    );
-
+                    const cardLink = xCardContainer.querySelector('div[data-testid="card.layoutLarge.media"] > a[rel][aria-label], div[data-testid="card.layoutSmall.media"] > a[rel][aria-label], a[data-testid="card.wrapper"] > div > a[rel][aria-label]');
                     if (cardLink) {
                         const ariaLabel = cardLink.getAttribute('aria-label') || '';
-                        // aria-label = "ドメイン名 タイトル本文…"（先頭がドメイン名、以降がタイトル）
                         const spaceIdx = ariaLabel.indexOf(' ');
                         if (spaceIdx > 0) {
-                            // サイト名部分（= domain）をスキップしてタイトルだけ取り出す
                             const extracted = ariaLabel.substring(spaceIdx + 1).trim();
-                            if (extracted && extracted !== domain) {
-                                layer1Title = extracted;
-                            }
+                            if (extracted && extracted !== domain) layer1Title = extracted;
                         }
-
-                        // 画像は aria-label を持つリンク内の img から取得
-                        // src が空の場合は srcset の最初のURLを使う（Xの遅延ロード対策）
                         const cardImg = cardLink.querySelector('img');
                         if (cardImg) {
                             let imgSrc = cardImg.src || '';
-                            // srcset フォールバック（"https://... 1x, https://... 2x" 形式）
-                            if (!imgSrc && cardImg.srcset) {
-                                imgSrc = cardImg.srcset.split(',')[0].trim().split(' ')[0];
-                            }
-                            console.info('[x-to-bluesky] Layer1 card img src:', imgSrc);
+                            if (!imgSrc && cardImg.srcset) imgSrc = cardImg.srcset.split(',')[0].trim().split(' ')[0];
                             if (imgSrc.startsWith('blob:')) {
-                                try {
-                                    layer1ImageBlob = await (await fetch(imgSrc)).blob();
-                                } catch (e) { console.warn('[x-to-bluesky] Layer1 blob extract failed:', e); }
+                                try { layer1ImageBlob = await (await fetch(imgSrc)).blob(); } catch (e) {}
                             } else if (imgSrc.startsWith('http')) {
                                 layer1ImageHttpUrl = imgSrc;
                             }
                         }
                     }
-
-                    // ── フォールバック: aria-label が取れなかった場合は leafSpan 方式 ──
-                    if (!layer1Title) {
-                        const textContainer = xCardContainer.querySelector(SELECTORS.X_CARD_TEXT_CONTAINER);
-                        if (textContainer) {
-                            const leafSpans = Array.from(textContainer.querySelectorAll('span'))
-                                .filter(el => !el.querySelector('span') && el.textContent.trim().length > 0)
-                                .map(el => el.textContent.trim())
-                                .filter((t, i, arr) => arr.indexOf(t) === i);
-
-                            const withoutDomain = leafSpans.filter(t => t !== domain && !t.startsWith('http'));
-                            if (withoutDomain.length > 0) layer1Title = withoutDomain[0];
-                            if (withoutDomain.length > 1) layer1Description = withoutDomain.slice(1).join(' ');
-                        }
-
-                        // 画像もまだ取れていなければ img を総当たりで探す
-                        if (!layer1ImageBlob && !layer1ImageHttpUrl) {
-                            const xImgEl = xCardContainer.querySelector(SELECTORS.X_CARD_IMAGE);
-                            if (xImgEl?.src) {
-                                if (xImgEl.src.startsWith('blob:')) {
-                                    try {
-                                        layer1ImageBlob = await (await fetch(xImgEl.src)).blob();
-                                    } catch (e) { console.warn('[x-to-bluesky] Layer1 blob extract failed (fallback):', e); }
-                                } else if (xImgEl.src.startsWith('http')) {
-                                    layer1ImageHttpUrl = xImgEl.src;
-                                }
+                    const textContainer = xCardContainer.querySelector(SELECTORS.X_CARD_TEXT_CONTAINER);
+                    if (textContainer) {
+                        const leafSpans = Array.from(textContainer.querySelectorAll('span')).filter(el => !el.querySelector('span') && el.textContent.trim().length > 0).map(el => el.textContent.trim()).filter((t, i, arr) => arr.indexOf(t) === i);
+                        const candidates = leafSpans.filter(t => t !== domain && !t.startsWith('http') && t !== layer1Title);
+                        if (!layer1Title && candidates.length > 0) layer1Title = candidates.shift();
+                        if (candidates.length > 0) layer1Description = candidates.join(' ');
+                    }
+                    if (!layer1ImageBlob && !layer1ImageHttpUrl) {
+                        const xImgEl = xCardContainer.querySelector(SELECTORS.X_CARD_IMAGE);
+                        if (xImgEl?.src) {
+                            if (xImgEl.src.startsWith('blob:')) {
+                                try { layer1ImageBlob = await (await fetch(xImgEl.src)).blob(); } catch (e) {}
+                            } else if (xImgEl.src.startsWith('http')) {
+                                layer1ImageHttpUrl = xImgEl.src;
                             }
                         }
                     }
                 }
             }
-
-            // ──────────────────────────────────────
-            // 【第2層】OGP / Twitter Card を直接 fetch
-            // ──────────────────────────────────────
-            let layer2Card = null;
-            const layer1TitleIsWeak = !layer1Title || layer1Title === domain;
-            if (layer1TitleIsWeak) {
-                updateStatus('OGP...');
-                layer2Card = await fetchLinkCard(targetUrl);
-            }
-
-            // ──────────────────────────────────────
-            // 最終的な card オブジェクトの決定
-            // ──────────────────────────────────────
-            const finalTitle       = layer2Card?.title       || layer1Title       || domain;
+            updateStatus('OGP...');
+            const layer2Card = await fetchLinkCard(targetUrl);
+            const finalTitle = layer2Card?.title || layer1Title || domain;
             const finalDescription = layer2Card?.description || layer1Description || '';
-            // 画像優先度: 第2層OGP画像 → 第1層blob → 第1層http
-            const finalImageHttpUrl = layer2Card?.imageUrl   || layer1ImageHttpUrl || '';
-
-            console.info('[x-to-bluesky] Card resolved:', {
-                title: finalTitle,
-                layer1Title, layer1ImageHttpUrl, layer1ImageBlobSize: layer1ImageBlob?.size,
-                layer2ImageUrl: layer2Card?.imageUrl,
-                finalImageHttpUrl
-            });
-
-            // ──────────────────────────────────────
-            // 【第3層】すべてが失敗した場合の最終フォールバック
-            // ──────────────────────────────────────
-            const external = {
-                uri: targetUrl,
-                title: finalTitle.substring(0, 300),
-                description: finalDescription.substring(0, 800)
-            };
-
-            // サムネイル画像のアップロード
-            // 第1層で blob を取得済みの場合はそれを使い、HTTP の場合は改めて fetch する
+            const finalImageHttpUrl = layer2Card?.imageUrl || layer1ImageHttpUrl || '';
+            const external = { uri: targetUrl, title: finalTitle.substring(0, 300), description: finalDescription.substring(0, 800) };
+            
             if (layer2Card?.imageUrl && layer2Card.imageUrl.startsWith('http')) {
-                // 第2層（OGP）の画像を優先
                 try {
                     updateStatus('Thumb...');
-                    console.info('[x-to-bluesky] Fetching Layer2 thumb:', layer2Card.imageUrl);
                     const imgBlob = await fetchThumbSafely(layer2Card.imageUrl, CONFIG.TIMEOUT.DEFAULT);
                     const resized = await resizeImageBlob(imgBlob, CONFIG.IMAGE.THUMB_DIMENSION, CONFIG.IMAGE.COMPRESSION_QUALITY);
                     external.thumb = await bskyAPI.uploadBlob(resized.blob);
                 } catch (e) {
-                    console.warn('[x-to-bluesky] Layer2 thumb failed, trying layer1:', e);
-                    // 第2層画像が失敗したら第1層にフォールバック
                     if (layer1ImageBlob) {
                         try {
-                            console.info('[x-to-bluesky] Using Layer1 blob as fallback thumb');
                             const resized = await resizeImageBlob(layer1ImageBlob, CONFIG.IMAGE.THUMB_DIMENSION, CONFIG.IMAGE.COMPRESSION_QUALITY);
                             external.thumb = await bskyAPI.uploadBlob(resized.blob);
-                        } catch (e2) { console.warn('[x-to-bluesky] Layer1 blob thumb also failed:', e2); }
+                        } catch (e2) {}
                     }
                 }
             } else if (layer1ImageBlob) {
-                // 第2層に画像がなければ第1層 blob を使用
                 try {
-                    console.info('[x-to-bluesky] Using Layer1 blob thumb');
                     const resized = await resizeImageBlob(layer1ImageBlob, CONFIG.IMAGE.THUMB_DIMENSION, CONFIG.IMAGE.COMPRESSION_QUALITY);
                     external.thumb = await bskyAPI.uploadBlob(resized.blob);
-                } catch (e) { console.warn('[x-to-bluesky] Layer1 blob thumb failed:', e); }
+                } catch (e) {}
             } else if (finalImageHttpUrl.startsWith('http')) {
-                // 残った HTTP URL を最後の手段として使用
                 try {
                     updateStatus('Thumb...');
-                    console.info('[x-to-bluesky] Fetching fallback thumb:', finalImageHttpUrl);
                     const imgBlob = await fetchThumbSafely(finalImageHttpUrl, CONFIG.TIMEOUT.DEFAULT);
                     const resized = await resizeImageBlob(imgBlob, CONFIG.IMAGE.THUMB_DIMENSION, CONFIG.IMAGE.COMPRESSION_QUALITY);
                     external.thumb = await bskyAPI.uploadBlob(resized.blob);
-                } catch (e) { console.warn('[x-to-bluesky] Fallback thumb failed:', e); }
-            } else {
-                console.warn('[x-to-bluesky] No thumb image source available');
+                } catch (e) {}
             }
-
             return { $type: 'app.bsky.embed.external', external };
-
-        } catch (err) {
-            console.error('[x-to-bluesky] processExternalEmbed error:', err);
-            return null;
-        }
+        } catch (err) { return null; }
     };
 
-    // ─────────────────────────────
-    // PROCESS EMBEDS (IMAGES/VIDEOS)
-    // ─────────────────────────────
     const processVideoEmbed = async (videos, updateStatus) => {
         const el = videos[0];
         const src = el.src || el.currentSrc || el.querySelector?.('source')?.src;
@@ -393,9 +267,7 @@
         return { $type: 'app.bsky.embed.images', images };
     };
 
-    // ─────────────────────────────
-    // UI COMPONENTS
-    // ─────────────────────────────
+    // UI Components
     const showNotification = (text, isError = false) => {
         document.getElementById('bsky-notification')?.remove();
         const notif = document.createElement('div');
@@ -443,119 +315,60 @@
         });
     };
 
-    // ─────────────────────────────
-    // ROBUST POST HANDLER
-    // ─────────────────────────────
+    // Post logic
     const handlePost = async (e) => {
         if (isCurrentlyBridging) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); return; }
-
         const btn = e.currentTarget;
         if (!btn || btn.closest(SELECTORS.SIDE_NAV_POST_BUTTON) || !settings.crosspostChecked || !settings.handle || !settings.password) return;
-
         const tid = btn.getAttribute('data-testid'), txt = btn.textContent || '';
-        const isTargetButton = (tid === 'tweetButton' || tid === 'tweetButtonInline' || txt.includes('ポスト') || txt.includes('ツイート') || txt.includes('すべて') || txt.includes('返信') || txt.includes('Post') || txt.includes('Tweet') || txt.includes('Reply'));
+        const isTargetButton = (tid === 'tweetButton' || tid === 'tweetButtonInline' || txt.includes('Post') || txt.includes('Tweet') || txt.includes('Reply'));
         if (!isTargetButton) return;
-
         e.stopPropagation(); e.preventDefault(); e.stopImmediatePropagation();
         isCurrentlyBridging = true;
-
         const textNode = btn.querySelector('span span') || btn, originalText = textNode.textContent;
-        if (textNode && textNode !== btn) { Object.assign(textNode.style, { whiteSpace: 'nowrap', minWidth: '120px', display: 'inline-block', textAlign: 'center' }); }
+        if (textNode && textNode !== btn) Object.assign(textNode.style, { whiteSpace: 'nowrap', minWidth: '120px', display: 'inline-block', textAlign: 'center' });
         const updateStatus = msg => { if (textNode && textNode !== btn) textNode.textContent = msg; };
-
         let successBridging = false;
-
         try {
             btn.style.opacity = '0.7'; updateStatus('Init...');
             await bskyAPI.verifySession();
-
             const dialogContext = btn.closest('div[role="dialog"]') || btn.closest('form') || document.body;
             let editors = Array.from(dialogContext.querySelectorAll('[data-testid="tweetEditor"]'));
             if (editors.length === 0) editors = [dialogContext];
-
             let replyRef = null;
-            let postedCount = 0;
-
             for (let i = 0; i < editors.length; i++) {
                 const ed = editors[i];
                 let postText = '';
-
-                ed.querySelectorAll(SELECTORS.TEXT_AREA).forEach(textarea => {
-                    const t = (textarea.innerText || textarea.textContent || '').trim();
-                    if (t && t !== 'いまどうしてる？' && t !== 'What\'s happening?') postText = t;
-                });
-
-                if (!postText.trim()) {
-                    if (editors.length === 1) {
-                        isCurrentlyBridging = false; btn.removeEventListener('click', handlePost, true); btn.removeAttribute('data-bsky-listener'); btn.click(); return;
-                    }
-                    continue;
-                }
-
+                ed.querySelectorAll(SELECTORS.TEXT_AREA).forEach(textarea => { const t = (textarea.innerText || textarea.textContent || '').trim(); if (t) postText = t; });
+                if (!postText.trim()) { if (editors.length === 1) { isCurrentlyBridging = false; btn.removeEventListener('click', handlePost, true); btn.removeAttribute('data-bsky-listener'); btn.click(); return; } continue; }
                 const record = { $type: 'app.bsky.feed.post', text: postText, createdAt: new Date().toISOString(), facets: parseFacets(postText) };
                 if (replyRef) record.reply = replyRef;
-
                 const vids = ed.querySelectorAll(SELECTORS.VIDEO_ATTACHMENTS);
                 if (vids.length > 0) record.embed = await processVideoEmbed(vids, updateStatus);
-                else {
-                    const imgs = ed.querySelectorAll(SELECTORS.ATTACHMENTS);
-                    if (imgs.length > 0) record.embed = await processImageEmbed(imgs, updateStatus);
-                }
-
+                else { const imgs = ed.querySelectorAll(SELECTORS.ATTACHMENTS); if (imgs.length > 0) record.embed = await processImageEmbed(imgs, updateStatus); }
                 const urlsInText = postText.match(/(https?:\/\/[^\s]+)/g);
-                if (urlsInText && urlsInText.length > 0 && !record.embed) {
-                    const embedCard = await processExternalEmbed(urlsInText[0], updateStatus, ed);
-                    if (embedCard) record.embed = embedCard;
-                }
-
+                if (urlsInText && urlsInText.length > 0 && !record.embed) { const embedCard = await processExternalEmbed(urlsInText[0], updateStatus, ed); if (embedCard) record.embed = embedCard; }
                 const quote = ed.querySelector('[data-testid="tweetEditor"] [data-testid^="card.layout"] a[href*="/status/"]');
                 if (quote?.href) { record.text += '\n' + quote.href; record.facets = parseFacets(record.text); }
-
-                const prefix = editors.length > 1 ? `[${i + 1}/${editors.length}] ` : '';
-                updateStatus(`${prefix}Post...`);
-
+                updateStatus(`${editors.length > 1 ? `[${i + 1}/${editors.length}] ` : ''}Post...`);
                 const res = await bskyAPI.createPost(record);
-                postedCount++;
-
-                if (!replyRef) {
-                    replyRef = { root: { uri: res.uri, cid: res.cid }, parent: { uri: res.uri, cid: res.cid } };
-                } else {
-                    replyRef.parent = { uri: res.uri, cid: res.cid };
-                }
+                replyRef = replyRef ? { root: replyRef.root, parent: { uri: res.uri, cid: res.cid } } : { root: { uri: res.uri, cid: res.cid }, parent: { uri: res.uri, cid: res.cid } };
             }
-
-            if (postedCount > 0) { showNotification('Crossposted!'); successBridging = true; }
-        } catch (err) {
-            console.error('[x-to-bluesky]', err); showNotification(err.message, true);
-        } finally {
-            if (textNode && textNode !== btn) { Object.assign(textNode.style, { whiteSpace: '', minWidth: '', display: '', textAlign: '' }); }
+            if (replyRef) { showNotification('Crossposted!'); successBridging = true; }
+        } catch (err) { showNotification(err.message, true); } finally {
+            if (textNode && textNode !== btn) Object.assign(textNode.style, { whiteSpace: '', minWidth: '', display: '', textAlign: '' });
             updateStatus(originalText); btn.style.opacity = '1';
-
-            if (successBridging) {
-                setTimeout(() => {
-                    isCurrentlyBridging = false;
-                    if (btn && typeof btn.click === 'function') {
-                        btn.removeEventListener('click', handlePost, true);
-                        btn.removeAttribute('data-bsky-listener');
-                        btn.click();
-                    }
-                }, 1000);
-            } else {
-                setTimeout(() => { isCurrentlyBridging = false; }, 1000);
-            }
+            setTimeout(() => { isCurrentlyBridging = false; if (successBridging && btn) { btn.removeEventListener('click', handlePost, true); btn.removeAttribute('data-bsky-listener'); btn.click(); } }, 1000);
         }
     };
 
-    // ─────────────────────────────
-    // INITIALIZATION & OBSERVER
-    // ─────────────────────────────
+    // Initialization
     let obTimeout;
     const observer = new MutationObserver(() => {
         clearTimeout(obTimeout);
         obTimeout = setTimeout(() => {
             const navbar = document.querySelector(SELECTORS.NAV_BAR);
             let settingsIcon = document.getElementById('bsky-settings-nav-item');
-
             if (navbar && !settingsIcon) {
                 const wrapper = document.createElement('div');
                 wrapper.id = 'bsky-settings-nav-item';
@@ -566,15 +379,8 @@
                 wrapper.onclick = e => { e.preventDefault(); toggleSettings(); };
                 settingsIcon = wrapper;
             }
-
-            if (settingsIcon) {
-                settingsIcon.style.display = (window.innerWidth <= 687 && !!document.querySelector(SELECTORS.TEXT_AREA)) ? 'none' : '';
-            }
-
             injectCheckboxToToolbar();
-            document.querySelectorAll(SELECTORS.POST_BUTTON).forEach(b => {
-                if (!b.hasAttribute('data-bsky-listener')) { b.addEventListener('click', handlePost, true); b.setAttribute('data-bsky-listener', 'true'); }
-            });
+            document.querySelectorAll(SELECTORS.POST_BUTTON).forEach(b => { if (!b.hasAttribute('data-bsky-listener')) { b.addEventListener('click', handlePost, true); b.setAttribute('data-bsky-listener', 'true'); } });
         }, 100);
     });
     setInterval(injectCheckboxToToolbar, 400);
@@ -585,14 +391,13 @@
         .bsky-nav-link { display: flex; align-items: center; justify-content: center; width: 50px; height: 50px; border-radius: 9999px; transition: background-color 0.2s; text-decoration: none !important; }
         .bsky-nav-link:hover { background-color: rgba(231, 233, 234, 0.1); }
         .bsky-toolbar-checkbox-container { display: inline-flex !important; align-items: center !important; margin-left: 8px !important; height: 34px !important; }
-        .bsky-toolbar-crosspost-checkbox { display: inline-flex !important; align-items: center !important; font-family: TwitterChirp, -apple-system, sans-serif !important; font-size: 14px !important; color: currentColor !important; gap: 5px; cursor: pointer; user-select: none; }
+        .bsky-toolbar-crosspost-checkbox { display: inline-flex !important; align-items: center !important; font-family: sans-serif !important; font-size: 14px !important; color: currentColor !important; gap: 5px; cursor: pointer; user-select: none; }
         .bsky-toolbar-crosspost-checkbox input { width: 15px !important; height: 15px !important; cursor: pointer; accent-color: rgb(29, 155, 240); margin: 0 !important; }
-        div[role="progressbar"] ~ .bsky-nav-wrapper, div[data-testid="toolBar"] ~ .bsky-nav-wrapper, main [role="progressbar"] .bsky-nav-wrapper, div[data-testid="primaryColumn"] [role="progressbar"] ~ .bsky-nav-wrapper { display: none !important; }
-        .bsky-notification { position: fixed; bottom: 20px; right: 50%; transform: translateX(50%); background: rgb(29, 155, 240); color: white; padding: 12px 18px; border-radius: 8px; z-index: 99999; font-family: TwitterChirp, sans-serif; font-size: 13px; box-shadow: 0 4px 15px rgba(0,0,0,.3); transition: opacity .4s, transform .4s; }
+        .bsky-notification { position: fixed; bottom: 20px; right: 50%; transform: translateX(50%); background: rgb(29, 155, 240); color: white; padding: 12px 18px; border-radius: 8px; z-index: 99999; font-family: sans-serif; font-size: 13px; box-shadow: 0 4px 15px rgba(0,0,0,.3); transition: opacity .4s, transform .4s; }
         .bsky-notification.error { background: rgb(244, 33, 46); }
         .bsky-notification.fade-out { opacity: 0; transform: translateX(50%) translateY(30px); }
         .bsky-notification-title { font-weight: bold; margin-bottom: 2px; }
-        .bsky-settings { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); width: 300px; background: #15202b; padding: 15px; border-radius: 12px; border: 1px solid #38444d; box-shadow: 0 0 20px rgba(0,0,0,.6); z-index: 100000; font-family: TwitterChirp, sans-serif; color: white; font-size: 14px; }
+        .bsky-settings { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); width: 300px; background: #15202b; padding: 15px; border-radius: 12px; border: 1px solid #38444d; box-shadow: 0 0 20px rgba(0,0,0,.6); z-index: 100000; font-family: sans-serif; color: white; font-size: 14px; }
         .bsky-settings fieldset { border: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
         .bsky-settings legend { display: flex !important; align-items: baseline !important; justify-content: space-between !important; width: 100% !important; margin-bottom: 8px; }
         .legend-title { font-weight: bold; color: rgb(29, 155, 240); }
@@ -602,9 +407,7 @@
         .settings-actions button { background: rgb(29, 155, 240); border: none; color: white; padding: 6px 14px; border-radius: 9999px; cursor: pointer; font-weight: bold; font-size: 13px; }
     `);
 
-    // ─────────────────────────────
-    // BLUESKY RPC API
-    // ─────────────────────────────
+    // API Wrapper
     const bskyAPI = {
         async request(method, endpoint, data = null, customHeaders = {}) {
             return new Promise((resolve, reject) => {
