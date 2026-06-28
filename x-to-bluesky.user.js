@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         x-to-bluesky
-// @version      2.0b5
-// @description  Crosspost from X to Bluesky
+// @version      2.0b6
+// @description  Crosspost from X to Bluesky (Enhanced Link Card Parser)
 // @author       imgddotnet
 // @license      MIT
 // @namespace    imgddotnet
@@ -11,10 +11,10 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @connect      *
 // @connect      bsky.social
 // @connect      video.bsky.app
 // @connect      api.bsky.app
-// @connect      *
 // @run-at       document-end
 // ==/UserScript==
 
@@ -29,14 +29,13 @@
         TEXT_AREA: '[data-testid^="tweetTextarea_"],[data-testid*="tweetTextarea"],[role="textbox"][contenteditable="true"]',
         ATTACHMENTS: 'div[data-testid="attachments"] img',
         VIDEO_ATTACHMENTS: 'div[data-testid="attachments"] video',
-        X_CARD_CONTAINER: '[data-testid="card.wrapper"],[data-testid^="card.layout"]',
-        X_CARD_TEXT_CONTAINER: '[data-testid="card.layout.large.detail"],[data-testid="card.layout.small.detail"]',
+        X_CARD_CONTAINER: '[data-testid="card.wrapper"],[data-testid^="card.layout"],[data-testid="cardPreview"]',
         QUOTED_TWEET_TEXT: '[data-testid="tweetText"]',
         QUOTED_TWEET_AVATAR: '[data-testid="Tweet-User-Avatar"]'
     };
 
     const CONFIG = {
-        VERSION: '2.0b5',
+        VERSION: '2.0b6',
         TIMEOUT: { DEFAULT: 60000, PARSER: 15000, VIDEO_FETCH: 120000, VIDEO_UPLOAD: 180000 },
         IMAGE: { MAX_DIMENSION: 4000, MAX_SIZE: 975000, COMPRESSION_QUALITY: 0.85, THUMB_DIMENSION: 800 },
         VIDEO: {
@@ -46,6 +45,8 @@
             POLL_INTERVAL_MS: 2000, POLL_MAX_ATTEMPTS: 180
         }
     };
+
+    const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
     let settings = {
         pdsUrl: GM_getValue('bsky_pds_url', 'https://bsky.social').replace('https://https://', 'https://'),
@@ -81,6 +82,13 @@
     };
 
     const fetchBlobSafely = (url, timeoutMs = CONFIG.TIMEOUT.DEFAULT, headers = {}) => new Promise((resolve, reject) => {
+        if (url && url.startsWith('blob:')) {
+            fetch(url)
+                .then(res => res.blob())
+                .then(resolve)
+                .catch(reject);
+            return;
+        }
         GM_xmlhttpRequest({
             method: 'GET', url, responseType: 'blob', timeout: timeoutMs, headers,
             onload: r => r.status >= 200 && r.status < 300 ? resolve(r.response) : reject(new Error(`HTTP ${r.status}`)),
@@ -114,14 +122,41 @@
 
     const fetchThumbSafely = async (url, timeoutMs = CONFIG.TIMEOUT.DEFAULT) => {
         try { return await fetchBlobSafely(url, timeoutMs); } catch {
-            // Normalize Blogger CDN image URLs and retry
             const norm = url.replace(/\/w\d+[^/]*\//, '/s800/').replace(/\/s\d+\//, '/s800/');
             if (norm !== url) return fetchBlobSafely(norm, timeoutMs);
             throw new Error('Thumb fetch failed');
         }
     };
 
-    // Returns the common ancestor of tweetText and Tweet-User-Avatar (= quoted post container)
+    const fetchHtml = (url, extraHeaders = {}) => new Promise(resolve => {
+        GM_xmlhttpRequest({
+            method: 'GET', url, timeout: CONFIG.TIMEOUT.PARSER,
+            headers: { 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', ...extraHeaders },
+            onload: r => resolve(r.status >= 200 && r.status < 300 ? r.responseText : null),
+            onerror: () => resolve(null), ontimeout: () => resolve(null)
+        });
+    });
+
+    const parseOgp = (html, baseUrl) => {
+        try {
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const getMeta = (...props) => {
+                for (const p of props) {
+                    const val = doc.querySelector(`meta[name="${p}"],meta[property="${p}"]`)?.getAttribute('content')?.trim();
+                    if (val) return val;
+                }
+                return '';
+            };
+            const title = getMeta('twitter:title', 'og:title') || doc.querySelector('title')?.textContent?.trim() || '';
+            const description = getMeta('twitter:description', 'og:description', 'description');
+            let imageUrl = getMeta('twitter:image', 'twitter:image:src', 'og:image');
+            if (imageUrl && !imageUrl.startsWith('http')) {
+                try { imageUrl = new URL(imageUrl, new URL(baseUrl).origin).href; } catch { imageUrl = ''; }
+            }
+            return { title, description, imageUrl, doc };
+        } catch { return null; }
+    };
+
     const getQuotedContainer = editorEl => {
         const textEl = editorEl.querySelector(SELECTORS.QUOTED_TWEET_TEXT);
         const avatarEl = editorEl.querySelector(SELECTORS.QUOTED_TWEET_AVATAR);
@@ -134,14 +169,12 @@
         return null;
     };
 
-    // Returns x.com status URL for quote post: pendingQuoteUrl first, then page URL fallback
     const extractQuoteUrl = () => {
         if (pendingQuoteUrl) return pendingQuoteUrl;
         const m = location.pathname.match(/\/([A-Za-z0-9_]{1,50})\/status\/(\d{10,20})/);
         return m ? `https://x.com/${m[1]}/status/${m[2]}` : null;
     };
 
-    // Captures status URL from article DOM when retweet button is clicked
     const captureQuoteUrl = clickedEl => {
         const article = clickedEl.closest('article');
         if (!article) return;
@@ -151,7 +184,6 @@
         }
     };
 
-    // Returns true if el is inside a quoted post container or X link card
     const isInsideQuotedContent = (el, quotedContainer) => !!(
         (quotedContainer && quotedContainer.contains(el)) ||
         el.closest('[data-testid^="card.layout"]') ||
@@ -165,112 +197,152 @@
 
     // --- Embed processing ---
 
-    const fetchLinkCard = url => new Promise(resolve => {
+    const fetchOEmbed = oEmbedUrl => new Promise(resolve => {
         GM_xmlhttpRequest({
-            method: 'GET', url, timeout: CONFIG.TIMEOUT.PARSER,
-            headers: { 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+            method: 'GET', url: oEmbedUrl, timeout: CONFIG.TIMEOUT.PARSER,
+            headers: { 'User-Agent': BROWSER_UA },
             onload: res => {
                 try {
                     if (res.status < 200 || res.status >= 300) return resolve(null);
-                    const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
-                    const domain = new URL(url).hostname;
-                    const getMeta = (...props) => {
-                        for (const p of props) {
-                            const val = doc.querySelector(`meta[name="${p}"],meta[property="${p}"]`)?.getAttribute('content')?.trim();
-                            if (val) return val;
-                        }
-                        return '';
-                    };
-                    const title = getMeta('twitter:title', 'og:title') || doc.querySelector('title')?.textContent?.trim() || domain;
-                    const description = getMeta('twitter:description', 'og:description', 'description');
-                    let imageUrl = getMeta('twitter:image', 'twitter:image:src', 'og:image');
-                    if (imageUrl && !imageUrl.startsWith('http')) {
-                        try { imageUrl = new URL(imageUrl, new URL(url).origin).href; } catch { imageUrl = ''; }
-                    }
-                    if (!title || title === domain) return resolve(null);
-                    resolve({ title, description, imageUrl });
+                    const j = JSON.parse(res.responseText);
+                    resolve({ title: j.title || '', description: j.description || j.summary || '', imageUrl: j.thumbnail_url || '' });
                 } catch { resolve(null); }
             },
             onerror: () => resolve(null), ontimeout: () => resolve(null)
         });
     });
 
-    const uploadThumb = async (blob, httpUrl) => {
-        const { THUMB_DIMENSION: dim, COMPRESSION_QUALITY: q } = CONFIG.IMAGE;
-        if (blob) return bskyAPI.uploadBlob((await resizeImageBlob(blob, dim, q)).blob);
-        if (httpUrl?.startsWith('http')) return bskyAPI.uploadBlob((await resizeImageBlob(await fetchThumbSafely(httpUrl), dim, q)).blob);
-        return null;
+    const fetchOEmbedFromDoc = async (targetUrl, doc) => {
+        try {
+            const link = doc.querySelector('link[type="application/json+oembed"][href]');
+            if (!link) return null;
+            let oEmbedUrl = link.getAttribute('href');
+            if (!oEmbedUrl.startsWith('http')) oEmbedUrl = new URL(oEmbedUrl, new URL(targetUrl).origin).href;
+            return await fetchOEmbed(oEmbedUrl);
+        } catch { return null; }
     };
 
+    const fetchYouTubeOEmbed = async url => {
+        const vidId = url.match(/(?:v=|youtu\.be\/|embed\/)([A-Za-z0-9_-]{11})/)?.[1];
+        const r = await fetchOEmbed(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`);
+        if (r) {
+            if (vidId) r.imageUrl = `https://i.ytimg.com/vi/${vidId}/maxresdefault.jpg`;
+            return r;
+        }
+        const html = await fetchHtml(url, { 'User-Agent': BROWSER_UA });
+        if (html) {
+            const ogp = parseOgp(html, url);
+            if (ogp?.title) return { title: ogp.title, description: ogp.description, imageUrl: ogp.imageUrl || (vidId ? `https://i.ytimg.com/vi/${vidId}/maxresdefault.jpg` : '') };
+        }
+        return vidId ? { title: '', description: '', imageUrl: `https://i.ytimg.com/vi/${vidId}/maxresdefault.jpg` } : null;
+    };
+
+    // ★修正箇所: どんなネスト構造からでも確実に画面上のプレビューテキストを抽出するロジックへ変更
+    const extractXCardMeta = (editorEl, domain) => {
+        if (!editorEl) return { xCardTitle: '', xCardDesc: '', xCardImageUrl: '' };
+
+        let xCard = Array.from(editorEl.querySelectorAll(SELECTORS.X_CARD_CONTAINER))
+            .find(el => !isInsideQuotedContent(el, null));
+
+        if (!xCard) {
+            const context = editorEl.closest('div[role="dialog"]') || editorEl.closest('form') || document.body;
+            xCard = Array.from(context.querySelectorAll(SELECTORS.X_CARD_CONTAINER))
+                .find(el => !isInsideQuotedContent(el, null));
+        }
+
+        if (!xCard) return { xCardTitle: '', xCardDesc: '', xCardImageUrl: '' };
+
+        const domainBase = domain.replace(/^www\./, '').toLowerCase();
+
+        // TreeWalkerを使用して、要素の粒度に関わらずカード内のすべてのテキストノードを走査
+        const textNodes = [];
+        const walker = document.createTreeWalker(xCard, NodeFilter.SHOW_TEXT, null, false);
+        let node;
+        while ((node = walker.nextNode())) {
+            const t = node.textContent.trim();
+            if (t) textNodes.push(t);
+        }
+
+        const uniqueTexts = [...new Set(textNodes)];
+
+        // 不要な文字（ドメイン名、URL、1文字のアイコン、プレビュー削除ボタン名等）を除外
+        const candidates = uniqueTexts.filter(t => {
+            const tl = t.toLowerCase();
+            if (tl === domainBase || tl === domain.toLowerCase()) return false;
+            if (t.startsWith('http')) return false;
+            if (t.length <= 1) return false;
+            if (t === '取り消す' || t === '削除' || tl === 'dismiss' || tl === 'remove') return false;
+            return true;
+        });
+
+        let xCardTitle = '';
+        let xCardDesc = '';
+
+        if (candidates.length > 0) {
+            xCardTitle = candidates[0]; // 最初に見つかった有効テキストをタイトルへ
+            if (candidates.length > 1) {
+                xCardDesc = candidates.slice(1).join(' ');
+            }
+        }
+
+        // 画像の抽出（通常のimgタグのほか、プレビュー特有のdiv背景画像形式にも対応）
+        let xCardImageUrl = '';
+        const cardImg = xCard.querySelector('img[src]');
+        if (cardImg?.src && (cardImg.src.startsWith('http') || cardImg.src.startsWith('blob:'))) {
+            xCardImageUrl = cardImg.src;
+        } else {
+            const divs = xCard.querySelectorAll('div[style*="background-image"]');
+            for (const div of divs) {
+                const bg = div.style.backgroundImage;
+                const m = bg.match(/url\(['"]?(https?:\/\/[^'"\)]+)['"]?\)/); // 閉じカッコの誤判定を修正
+                if (m) { xCardImageUrl = m[1]; break; }
+            }
+        }
+
+        return { xCardTitle, xCardDesc, xCardImageUrl };
+    };
+
+    // Build external embed: X DOM first → Fallback to YouTube oEmbed / OGP discovery
     const processExternalEmbed = async (targetUrl, updateStatus, editorEl) => {
         try {
             const domain = new URL(targetUrl).hostname;
             if (domain.includes('x.com') || domain.includes('twitter.com')) return null;
-            updateStatus('Card...');
-            let layer1Blob = null, layer1Title = '', layer1Desc = '', layer1HttpUrl = '';
+            const isYouTube = domain.includes('youtube.com') || domain.includes('youtu.be');
 
-            // Layer 1: extract title/image from X's rendered link card in the editor
-            const xCard = Array.from(editorEl.querySelectorAll(SELECTORS.X_CARD_CONTAINER))
-                .find(el => !isInsideQuotedContent(el, null)) || null;
-            if (xCard) {
-                const cardLink = xCard.querySelector(
-                    'div[data-testid="card.layoutLarge.media"] > a[rel][aria-label],' +
-                    'div[data-testid="card.layoutSmall.media"] > a[rel][aria-label],' +
-                    'a[data-testid="card.wrapper"] > div > a[rel][aria-label]'
-                );
-                if (cardLink) {
-                    const ariaLabel = cardLink.getAttribute('aria-label') || '';
-                    const spaceIdx = ariaLabel.indexOf(' ');
-                    if (spaceIdx > 0) {
-                        const t = ariaLabel.substring(spaceIdx + 1).trim();
-                        if (t && t !== domain) layer1Title = t;
-                    }
-                    const cardImg = cardLink.querySelector('img');
-                    if (cardImg) {
-                        let src = cardImg.src || (cardImg.srcset ? cardImg.srcset.split(',')[0].trim().split(' ')[0] : '');
-                        if (src.startsWith('blob:')) { try { layer1Blob = await (await fetch(src)).blob(); } catch {} }
-                        else if (src.startsWith('http')) layer1HttpUrl = src;
+            // 1. 先にX上のリンクカード（DOM）からメタ情報を抽出
+            const { xCardTitle, xCardDesc, xCardImageUrl } = extractXCardMeta(editorEl, domain);
+
+            let title       = (xCardTitle || '').trim();
+            let description = (xCardDesc || '').trim();
+            let imageUrl    = xCardImageUrl || '';
+
+            // 2. XのDOMからタイトルが取得できなかった場合のみ、外部へフェッチを行う（フォールバック）
+            if (!title) {
+                updateStatus('OGP...');
+                let ogp = null, oembed = null;
+                if (isYouTube) {
+                    oembed = await fetchYouTubeOEmbed(targetUrl);
+                } else {
+                    const html = await fetchHtml(targetUrl, { 'User-Agent': BROWSER_UA });
+                    if (html) {
+                        ogp = parseOgp(html, targetUrl);
+                        oembed = ogp ? await fetchOEmbedFromDoc(targetUrl, ogp.doc) : null;
                     }
                 }
-                const textBox = xCard.querySelector(SELECTORS.X_CARD_TEXT_CONTAINER);
-                if (textBox) {
-                    const spans = Array.from(textBox.querySelectorAll('span'))
-                        .filter(el => !el.querySelector('span') && el.textContent.trim())
-                        .map(el => el.textContent.trim())
-                        .filter((t, i, a) => a.indexOf(t) === i);
-                    const cands = spans.filter(t => t !== domain && !t.startsWith('http') && t !== layer1Title);
-                    if (!layer1Title && cands.length) layer1Title = cands.shift();
-                    if (cands.length) layer1Desc = cands.join(' ');
-                }
-                if (!layer1Blob && !layer1HttpUrl) {
-                    const xImg = xCard.querySelector('img');
-                    if (xImg?.src) {
-                        if (xImg.src.startsWith('blob:')) { try { layer1Blob = await (await fetch(xImg.src)).blob(); } catch {} }
-                        else if (xImg.src.startsWith('http')) layer1HttpUrl = xImg.src;
-                    }
-                }
+
+                title       = (oembed?.title       || ogp?.title       || domain).trim();
+                description = (oembed?.description || ogp?.description || '').trim();
+                imageUrl    = imageUrl || ogp?.imageUrl || oembed?.imageUrl || '';
             }
 
-            // Layer 2: fetch OGP/Twitter Card meta tags
-            updateStatus('OGP...');
-            const ogp = await fetchLinkCard(targetUrl);
-            const external = {
-                uri: targetUrl,
-                title: (ogp?.title || layer1Title || domain).substring(0, 300),
-                description: (ogp?.description || layer1Desc || '').substring(0, 800)
-            };
-
-            // Thumbnail: prefer OGP image, fall back to layer1
-            updateStatus('Thumb...');
-            try {
-                if (ogp?.imageUrl?.startsWith('http')) {
-                    try { external.thumb = await uploadThumb(null, ogp.imageUrl); }
-                    catch { external.thumb = await uploadThumb(layer1Blob, layer1HttpUrl) || undefined; }
-                } else {
-                    external.thumb = await uploadThumb(layer1Blob, layer1HttpUrl) || undefined;
-                }
-            } catch {}
-
+            const external = { uri: targetUrl, title: title.substring(0, 300), description: description.substring(0, 800) };
+            if (imageUrl.startsWith('http') || imageUrl.startsWith('blob:')) {
+                try {
+                    updateStatus('Thumb...');
+                    const { THUMB_DIMENSION: dim, COMPRESSION_QUALITY: q } = CONFIG.IMAGE;
+                    external.thumb = await bskyAPI.uploadBlob((await resizeImageBlob(await fetchThumbSafely(imageUrl), dim, q)).blob);
+                } catch {}
+            }
             return { $type: 'app.bsky.embed.external', external };
         } catch { return null; }
     };
@@ -334,7 +406,8 @@
 
     const injectCheckboxToToolbar = () => {
         document.querySelectorAll(SELECTORS.POST_TOOLBAR).forEach(toolbar => {
-            if (toolbar.querySelector('.bsky-toolbar-checkbox-container') || !toolbar.firstChild) return;
+            if (toolbar.hasAttribute('data-bsky-injected') || !toolbar.firstChild) return;
+            toolbar.setAttribute('data-bsky-injected', 'true');
             const container = document.createElement('div');
             container.className = 'bsky-toolbar-checkbox-container';
             container.innerHTML = `<label class="bsky-toolbar-crosspost-checkbox"><input type="checkbox" ${settings.crosspostChecked ? 'checked' : ''}><span>Bluesky</span></label>`;
@@ -382,7 +455,6 @@
                 if (replyRef) record.reply = replyRef;
 
                 if (!isQuotePost) {
-                    // Normal post: process own attachments and link card
                     const { images, videos } = getOwnAttachments(ed, null);
                     if (videos.length) {
                         try { record.embed = await processVideoEmbed(videos, updateStatus); }
@@ -395,7 +467,6 @@
                         if (urls?.length) { const card = await processExternalEmbed(urls[0], updateStatus, ed); if (card) record.embed = card; }
                     }
                 } else {
-                    // Quote post: append x.com URL as text, no embed
                     const quoteUrl = extractQuoteUrl();
                     if (quoteUrl) { record.text += '\n' + quoteUrl; record.facets = parseFacets(record.text); }
                 }
@@ -435,16 +506,17 @@
             document.querySelectorAll(SELECTORS.POST_BUTTON).forEach(b => {
                 if (!b.hasAttribute('data-bsky-listener')) { b.addEventListener('click', handlePost, true); b.setAttribute('data-bsky-listener', 'true'); }
             });
+            if (/iPhone/.test(navigator.userAgent)) {
+                const isCompose = location.pathname === '/compose/post';
+                document.body.classList.toggle('bsky-iphone-compose', isCompose);
+                document.body.classList.toggle('bsky-iphone-home', !isCompose);
+            }
         }, 100);
     });
 
-    setInterval(injectCheckboxToToolbar, 400);
-
-    // Capture quote target URL when retweet button is clicked (article still in DOM at this point)
     document.addEventListener('click', e => {
         const retweetBtn = e.target.closest('[data-testid="retweet"]');
         if (retweetBtn) { captureQuoteUrl(retweetBtn); return; }
-        // Fallback: if pendingQuoteUrl not set by retweet button, try page URL on Quote menu click
         const menuItem = e.target.closest('[role="menuitem"]');
         if (menuItem && (menuItem.textContent.includes('Quote') || menuItem.textContent.includes('引用')) && !pendingQuoteUrl) {
             const m = location.pathname.match(/\/([A-Za-z0-9_]{1,50})\/status\/(\d{10,20})/);
@@ -452,12 +524,40 @@
         }
     }, true);
 
+    if (/iPhone/.test(navigator.userAgent)) {
+        const applyIPhoneVisibility = pathname => {
+            const isCompose = pathname === '/compose/post';
+            document.body.classList.toggle('bsky-iphone-compose', isCompose);
+            document.body.classList.toggle('bsky-iphone-home', !isCompose);
+        };
+        const origPushState = history.pushState.bind(history);
+        history.pushState = (...args) => {
+            origPushState(...args);
+            try { applyIPhoneVisibility(new URL(args[2], location.origin).pathname); }
+            catch { applyIPhoneVisibility(location.pathname); }
+        };
+        window.addEventListener('popstate', () => applyIPhoneVisibility(location.pathname));
+        const iPhoneInitObserver = new MutationObserver(() => {
+            if (document.getElementById('bsky-settings-nav-item')) {
+                applyIPhoneVisibility(location.pathname);
+                iPhoneInitObserver.disconnect();
+            }
+        });
+        iPhoneInitObserver.observe(document.body, { childList: true, subtree: true });
+        applyIPhoneVisibility(location.pathname);
+    }
+
     GM_addStyle(`
         .bsky-nav-wrapper.pc-nav { display: flex; align-items: center; justify-content: center; width: 100%; padding: 4px 0; }
         .bsky-nav-wrapper.mobile-nav { display: flex; align-items: center; justify-content: center; flex: 1 1 0%; height: 100%; min-width: 0; }
+        .bsky-iphone-compose-hide { display: none !important; }
         .bsky-nav-link { display: flex; align-items: center; justify-content: center; width: 50px; height: 50px; border-radius: 9999px; transition: background-color 0.2s; text-decoration: none !important; }
         .bsky-nav-link:hover { background-color: rgba(231, 233, 234, 0.1); }
         .bsky-toolbar-checkbox-container { display: inline-flex !important; align-items: center !important; margin-left: 8px !important; height: 34px !important; }
+        body.bsky-iphone-home    #bsky-settings-nav-item           { display: flex        !important; }
+        body.bsky-iphone-compose #bsky-settings-nav-item           { display: none        !important; }
+        body.bsky-iphone-home    .bsky-toolbar-checkbox-container   { display: none        !important; }
+        body.bsky-iphone-compose .bsky-toolbar-checkbox-container   { display: inline-flex !important; }
         .bsky-toolbar-crosspost-checkbox { display: inline-flex !important; align-items: center !important; font-family: sans-serif !important; font-size: 14px !important; color: currentColor !important; gap: 5px; cursor: pointer; user-select: none; }
         .bsky-toolbar-crosspost-checkbox input { width: 15px !important; height: 15px !important; cursor: pointer; accent-color: rgb(29, 155, 240); margin: 0 !important; }
         .bsky-notification { position: fixed; bottom: 20px; right: 50%; transform: translateX(50%); background: rgb(29, 155, 240); color: white; padding: 12px 18px; border-radius: 8px; z-index: 99999; font-family: sans-serif; font-size: 13px; box-shadow: 0 4px 15px rgba(0,0,0,.3); transition: opacity .4s, transform .4s; }
