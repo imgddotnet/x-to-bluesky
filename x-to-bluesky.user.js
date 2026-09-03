@@ -69,6 +69,21 @@
         crosspostChecked: GM_getValue('bsky_crosspost_checked', false)
     };
     let settingsPanel = null, isCurrentlyBridging = false, pendingQuoteUrl = null;
+    // Xステータスid -> Bluesky投稿(uri/cid/rootUri/rootCid) の対応表。自分の投稿への返信チェーン再現に使う。
+    let postMap = GM_getValue('bsky_post_map', {});
+    let pendingCaptures = [];
+    const armPostCapture = results => {
+        const timeoutId = setTimeout(() => { pendingCaptures = pendingCaptures.filter(p => p.timeoutId !== timeoutId); }, 8000);
+        pendingCaptures.push({ results, timeoutId });
+    };
+    const tryCaptureFromPath = pathname => {
+        if (!pendingCaptures.length) return;
+        const m = pathname.match(/\/status\/(\d{10,20})/); if (!m) return;
+        const { results, timeoutId } = pendingCaptures.shift(); clearTimeout(timeoutId);
+        const last = results[results.length - 1]; if (!last) return;
+        postMap[m[1]] = { uri: last.uri, cid: last.cid, rootUri: last.rootUri, rootCid: last.rootCid };
+        GM_setValue('bsky_post_map', postMap);
+    };
 
     // 3. ネットワーククライアント
     const NetworkClient = {
@@ -158,18 +173,23 @@
             }
             return vidId ? { title: '', description: '', imageUrl: `https://i.ytimg.com/vi/${vidId}/maxresdefault.jpg` } : null;
         },
+        // 追加: X/Twitter用oEmbed（publish.twitter.com）。画像は返らないため title/description のみ。
+        async fetchXOEmbed(url) {
+            const j = await NetworkClient.fetchOEmbed(`https://publish.twitter.com/oembed?url=${encodeURIComponent(url)}&omit_script=true`);
+            if (!j) return null;
+            const text = j.html ? j.html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : '';
+            return { title: j.author_name || '', description: text, imageUrl: '' };
+        },
         extractXCardMeta(editorEl, domain) {
             if (!editorEl) return { xCardTitle: '', xCardDesc: '', xCardImageUrl: '' };
             let xCard = Array.from(editorEl.querySelectorAll(SELECTORS.X_CARD_CONTAINER)).find(el => !DomQuery.isInsideQuotedContent(el, null));
             if (!xCard) { xCard = Array.from((editorEl.closest('div[role="dialog"]') || editorEl.closest('form') || document.body).querySelectorAll(SELECTORS.X_CARD_CONTAINER)).find(el => !DomQuery.isInsideQuotedContent(el, null)); }
             if (!xCard) return { xCardTitle: '', xCardDesc: '', xCardImageUrl: '' };
-
             const domainBase = domain.replace(/^www\./, '').toLowerCase(), textNodes = [], walker = document.createTreeWalker(xCard, NodeFilter.SHOW_TEXT, null, false);
             let node; while ((node = walker.nextNode())) { const t = node.textContent.trim(); if (t) textNodes.push(t); }
             const candidates = [...new Set(textNodes)].filter(t => {
                 const tl = t.toLowerCase(); return tl !== domainBase && tl !== domain.toLowerCase() && !t.startsWith('http') && t.length > 1 && t !== '取り消す' && t !== '削除' && tl !== 'dismiss' && tl !== 'remove';
             });
-
             let xCardTitle = candidates[0] || '', xCardDesc = candidates.length > 1 ? candidates.slice(1).join(' ') : '', xCardImageUrl = '';
             const cardImg = xCard.querySelector('img[src]');
             if (cardImg?.src && (cardImg.src.startsWith('http') || cardImg.src.startsWith('blob:'))) { xCardImageUrl = cardImg.src; }
@@ -198,6 +218,20 @@
             }
         },
         isInsideQuotedContent: (el, quotedContainer) => !!((quotedContainer && quotedContainer.contains(el)) || el.closest('[data-testid^="card.layout"]') || el.closest('[data-testid="card.wrapper"]')),
+        // 返信先ツイートのstatus IDを推定（ダイアログ内の返信先article、なければ現在ページのURL）
+        extractReplyTargetId(dialogContext, editorEl) {
+            if (dialogContext !== document.body) {
+                for (const art of dialogContext.querySelectorAll('article')) {
+                    if (editorEl.contains(art) || art.contains(editorEl)) continue;
+                    for (const a of art.querySelectorAll('a[href]')) {
+                        const m = (a.getAttribute('href') || '').match(/^\/([A-Za-z0-9_]{1,50})\/status\/(\d{10,20})/);
+                        if (m) return m[2];
+                    }
+                }
+            }
+            const m2 = location.pathname.match(/\/status\/(\d{10,20})/);
+            return m2 ? m2[1] : null;
+        },
         getOwnAttachments(editorEl, quotedContainer) {
             return {
                 images: Array.from(editorEl.querySelectorAll(SELECTORS.ATTACHMENTS)).filter(el => !this.isInsideQuotedContent(el, quotedContainer)),
@@ -220,17 +254,20 @@
             img.onerror = () => resolve({ blob, aspectRatio: { width: 1, height: 1 } });
             objectUrl = URL.createObjectURL(blob); img.src = objectUrl;
         }),
-        async processExternalEmbed(targetUrl, updateStatus, editorEl) {
+        // 変更: skipXCheck を追加。true の場合は x.com/twitter.com ドメインでも処理を続行する（引用ポスト用）
+        async processExternalEmbed(targetUrl, updateStatus, editorEl, skipXCheck = false) {
             try {
-                const domain = new URL(targetUrl).hostname; if (domain.includes('x.com') || domain.includes('twitter.com')) return null;
+                const domain = new URL(targetUrl).hostname;
+                const isX = domain.includes('x.com') || domain.includes('twitter.com');
+                if (!skipXCheck && isX) return null;
                 const isYouTube = domain.includes('youtube.com') || domain.includes('youtu.be');
                 const { xCardTitle, xCardDesc, xCardImageUrl } = DataParser.extractXCardMeta(editorEl, domain);
                 let title = (xCardTitle || '').trim(), description = (xCardDesc || '').trim(), imageUrl = xCardImageUrl || '';
-
                 if (!title) {
                     updateStatus(PROGRESS_STATUS.FETCHING_OGP);
                     let ogp = null, oembed = null;
                     if (isYouTube) { oembed = await DataParser.fetchYouTubeOEmbed(targetUrl); }
+                    else if (isX) { oembed = await DataParser.fetchXOEmbed(targetUrl); }
                     else { const html = await NetworkClient.fetchHtml(targetUrl, { 'User-Agent': CONFIG.USER_AGENT }); if (html) { ogp = DataParser.parseOgp(html, targetUrl); oembed = ogp ? await DataParser.fetchOEmbedFromDoc(targetUrl, ogp.doc) : null; } }
                     title = (oembed?.title || ogp?.title || domain).trim(); description = (oembed?.description || ogp?.description || '').trim(); imageUrl = imageUrl || ogp?.imageUrl || oembed?.imageUrl || '';
                 }
@@ -349,25 +386,38 @@
             btn.style.opacity = '0.7'; updateStatus(PROGRESS_STATUS.INITIALIZING); await bskyAPI.verifySession();
             const dialogContext = btn.closest('div[role="dialog"]') || btn.closest('form') || document.body;
             let editors = Array.from(dialogContext.querySelectorAll('[data-testid="tweetEditor"]')); if (!editors.length) editors = [dialogContext];
-            let replyRef = null;
+            let replyRef = null; const createdResults = [];
             for (let i = 0; i < editors.length; i++) {
                 const ed = editors[i]; let postText = ''; ed.querySelectorAll(SELECTORS.TEXT_AREA).forEach(ta => { const t = (ta.innerText || ta.textContent || '').trim(); if (t) postText = t; });
                 if (!postText.trim()) { if (editors.length === 1) { isCurrentlyBridging = false; btn.removeEventListener('click', handlePost, true); btn.removeAttribute('data-bsky-listener'); btn.click(); return; } continue; }
                 const quotedContainer = DomQuery.getQuotedContainer(ed), isQuotePost = !!quotedContainer;
+                if (!isQuotePost && !replyRef) {
+                    const replyTargetId = DomQuery.extractReplyTargetId(dialogContext, ed);
+                    const mapped = replyTargetId && postMap[replyTargetId];
+                    if (mapped) replyRef = { root: { uri: mapped.rootUri, cid: mapped.rootCid }, parent: { uri: mapped.uri, cid: mapped.cid } };
+                }
                 const record = { $type: 'app.bsky.feed.post', text: postText, createdAt: new Date().toISOString(), facets: DataParser.parseFacets(postText) };
                 if (replyRef) record.reply = replyRef;
-
                 if (!isQuotePost) {
                     const { images, videos } = DomQuery.getOwnAttachments(ed, null);
                     if (videos.length) { try { record.embed = await MediaProcessor.processVideoEmbed(videos, updateStatus); } catch (err) { UiManager.showNotification(`Video: ${err.message}`, true); } }
                     else if (images.length) { record.embed = await MediaProcessor.processImageEmbed(images, updateStatus); }
                     if (!record.embed) { const urls = postText.match(/(https?:\/\/[^\s]+)/g); if (urls?.length) { const card = await MediaProcessor.processExternalEmbed(urls[0], updateStatus, ed); if (card) record.embed = card; } }
-                } else { const quoteUrl = DomQuery.extractQuoteUrl(); if (quoteUrl) { record.text += '\n' + quoteUrl; record.facets = DataParser.parseFacets(record.text); } }
-
+                } else {
+                    const quoteUrl = DomQuery.extractQuoteUrl();
+                    if (quoteUrl) {
+                        record.text += '\n' + quoteUrl;
+                        record.facets = DataParser.parseFacets(record.text);
+                        const card = await MediaProcessor.processExternalEmbed(quoteUrl, updateStatus, ed, true);
+                        if (card) record.embed = card;
+                    }
+                }
                 updateStatus(`${editors.length > 1 ? `[${i + 1}/${editors.length}] ` : ''}${PROGRESS_STATUS.POSTING}`); const res = await bskyAPI.createPost(record);
-                replyRef = replyRef ? { root: replyRef.root, parent: { uri: res.uri, cid: res.cid } } : { root: { uri: res.uri, cid: res.cid }, parent: { uri: res.uri, cid: res.cid } };
+                const rootUri = record.reply ? record.reply.root.uri : res.uri, rootCid = record.reply ? record.reply.root.cid : res.cid;
+                createdResults.push({ uri: res.uri, cid: res.cid, rootUri, rootCid });
+                replyRef = { root: { uri: rootUri, cid: rootCid }, parent: { uri: res.uri, cid: res.cid } };
             }
-            if (replyRef) { UiManager.showNotification('Crossposted!'); successBridging = true; }
+            if (createdResults.length) { armPostCapture(createdResults); UiManager.showNotification('Crossposted!'); successBridging = true; }
         } catch (err) { UiManager.showNotification(err.message, true); } finally {
             if (textNode !== btn) Object.assign(textNode.style, { whiteSpace: '', minWidth: '', display: '', textAlign: '' });
             updateStatus(originalText); btn.style.opacity = '1'; pendingQuoteUrl = null;
@@ -403,11 +453,13 @@
         }
     }, true);
 
-    if (/iPhone/.test(navigator.userAgent)) {
-        const applyIPhoneVisibility = pathname => { const isCompose = pathname === '/compose/post'; document.body.classList.toggle('bsky-iphone-compose', isCompose); document.body.classList.toggle('bsky-iphone-home', !isCompose); };
-        const origPushState = history.pushState.bind(history);
-        history.pushState = (...args) => { origPushState(...args); try { applyIPhoneVisibility(new URL(args[2], location.origin).pathname); } catch { applyIPhoneVisibility(location.pathname); } };
-        window.addEventListener('popstate', () => applyIPhoneVisibility(location.pathname));
+    const isIPhone = /iPhone/.test(navigator.userAgent);
+    const applyIPhoneVisibility = pathname => { const isCompose = pathname === '/compose/post'; document.body.classList.toggle('bsky-iphone-compose', isCompose); document.body.classList.toggle('bsky-iphone-home', !isCompose); };
+    const onPathChange = pathname => { tryCaptureFromPath(pathname); if (isIPhone) applyIPhoneVisibility(pathname); };
+    const origPushState = history.pushState.bind(history);
+    history.pushState = (...args) => { origPushState(...args); try { onPathChange(new URL(args[2], location.origin).pathname); } catch { onPathChange(location.pathname); } };
+    window.addEventListener('popstate', () => onPathChange(location.pathname));
+    if (isIPhone) {
         const iPhoneInitObserver = new MutationObserver(() => { if (document.getElementById('bsky-settings-nav-item')) { applyIPhoneVisibility(location.pathname); iPhoneInitObserver.disconnect(); } });
         iPhoneInitObserver.observe(document.body, { childList: true, subtree: true }); applyIPhoneVisibility(location.pathname);
     }
